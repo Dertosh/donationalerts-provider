@@ -64,6 +64,6 @@ endif()
 
 include(GNUInstallDirs)
 install(TARGETS donationalerts_obs_provider
-  RUNTIME DESTINATION "obs-plugins/64bit"
-  LIBRARY DESTINATION "obs-plugins/64bit"
+  RUNTIME DESTINATION "plugins/donationalerts-obs-provider/bin/64bit"
+  LIBRARY DESTINATION "plugins/donationalerts-obs-provider/bin/64bit"
 )
