@@ -1,10 +1,11 @@
 #include "provider_server.hpp"
+#include "provider_panel.hpp"
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 
-#include <windows.h>
-#include <shellapi.h>
+#include <QDockWidget>
+#include <QWidget>
 
 #include <memory>
 #include <exception>
@@ -16,14 +17,19 @@ OBS_MODULE_USE_DEFAULT_LOCALE("donationalerts-obs-provider", "en-US")
 namespace {
 
 std::unique_ptr<ProviderServer> provider;
+constexpr char kDockId[] = "donationalertsProviderDock";
+bool dock_registered = false;
 
-void open_admin_panel(void *)
+void open_provider_panel(void *)
 {
-	const auto result = reinterpret_cast<std::intptr_t>(
-		ShellExecuteW(nullptr, L"open", L"http://127.0.0.1:4041/admin", nullptr, nullptr, SW_SHOWNORMAL));
-	if (result <= 32)
-		blog(LOG_ERROR, "[DonationAlerts Provider] Could not open the admin page (ShellExecute error %lld).",
-		     static_cast<long long>(result));
+	auto *main_window = static_cast<QWidget *>(obs_frontend_get_main_window());
+	if (!main_window)
+		return;
+	auto *dock = main_window->findChild<QDockWidget *>(QString::fromLatin1(kDockId));
+	if (dock) {
+		dock->show();
+		dock->raise();
+	}
 }
 
 } // namespace
@@ -38,12 +44,18 @@ bool obs_module_load(void)
 			return false;
 		}
 
-		blog(LOG_INFO, "[DonationAlerts Provider] Local admin page: http://127.0.0.1:4041/admin");
-		blog(LOG_WARNING, "[DonationAlerts Provider] Admin token (keep private): %s", instance->admin_token().c_str());
-		blog(LOG_INFO, "[DonationAlerts Provider] Listening on localhost only; DonationAlerts OAuth is not configured yet.");
-
+		auto *panel = new ProviderPanel(instance->admin_token());
+		if (!obs_frontend_add_dock_by_id(kDockId, obs_module_text("Panel.Title"), panel)) {
+			delete panel;
+			instance->stop();
+			blog(LOG_ERROR, "[DonationAlerts Provider] Could not register the OBS dock.");
+			return false;
+		}
+		dock_registered = true;
 		provider = std::move(instance);
-		obs_frontend_add_tools_menu_item("Open DonationAlerts Provider", open_admin_panel, nullptr);
+		blog(LOG_INFO, "[DonationAlerts Provider] Local API listening on 127.0.0.1:4041; OBS dock registered.");
+		blog(LOG_INFO, "[DonationAlerts Provider] DonationAlerts OAuth is not configured yet.");
+		obs_frontend_add_tools_menu_item(obs_module_text("Menu.OpenPanel"), open_provider_panel, nullptr);
 		return true;
 	} catch (const std::exception &error) {
 		blog(LOG_ERROR, "[DonationAlerts Provider] Failed to start: %s", error.what());
@@ -53,6 +65,10 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	if (dock_registered) {
+		obs_frontend_remove_dock(kDockId);
+		dock_registered = false;
+	}
 	if (provider) {
 		provider->stop();
 		provider.reset();

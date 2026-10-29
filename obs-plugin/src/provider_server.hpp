@@ -33,6 +33,7 @@ private:
 	void run(std::stop_token stop_token);
 	void handle_request(std::uintptr_t client_socket, const HttpRequest &request, std::string_view origin);
 	std::string list_widget_tokens();
+	bool authorize_widget(const HttpRequest &request, std::string_view required_scope);
 	HttpResponse issue_widget_token(std::string_view body);
 	HttpResponse revoke_widget_token(std::string_view body);
 };

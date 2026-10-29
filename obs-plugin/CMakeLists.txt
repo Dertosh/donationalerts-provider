@@ -8,12 +8,16 @@ endif()
 set(OBS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.obs-sdk" CACHE PATH "OBS SDK prepared by tools/prepare-obs-sdk.ps1")
 set(OBS_SOURCE_DIR "${OBS_SDK_ROOT}/source/obs-studio-32.2.2-sources")
 set(OBS_BUILD_DIR "${OBS_SDK_ROOT}/build")
+set(OBS_QT_DIR "${OBS_SOURCE_DIR}/.deps/obs-deps-qt6-2026-07-15-x64")
 
 foreach(required_file IN ITEMS
     "${OBS_SOURCE_DIR}/libobs/obs-module.h"
     "${OBS_SOURCE_DIR}/frontend/api/obs-frontend-api.h"
     "${OBS_BUILD_DIR}/libobs/Release/obs.lib"
-    "${OBS_BUILD_DIR}/frontend/api/Release/obs-frontend-api.lib")
+    "${OBS_BUILD_DIR}/frontend/api/Release/obs-frontend-api.lib"
+    "${OBS_QT_DIR}/include/QtWidgets/QWidget"
+    "${OBS_QT_DIR}/lib/Qt6Widgets.lib"
+    "${OBS_QT_DIR}/lib/Qt6Network.lib")
   if(NOT EXISTS "${required_file}")
     message(FATAL_ERROR "OBS SDK is missing '${required_file}'. Run tools/prepare-obs-sdk.ps1 first.")
   endif()
@@ -21,27 +25,41 @@ endforeach()
 
 add_library(donationalerts_obs_provider MODULE
   src/plugin.cpp
+  src/provider_panel.cpp
   src/provider_server.cpp
 )
 
 target_compile_features(donationalerts_obs_provider PRIVATE cxx_std_20)
 target_compile_definitions(donationalerts_obs_provider PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+if(MSVC)
+  target_compile_options(donationalerts_obs_provider PRIVATE /utf-8 /Zc:__cplusplus)
+endif()
 target_include_directories(donationalerts_obs_provider PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${OBS_SOURCE_DIR}/libobs"
   "${OBS_SOURCE_DIR}/libobs/util"
   "${OBS_BUILD_DIR}/config"
   "${OBS_SOURCE_DIR}/frontend/api"
+  "${OBS_QT_DIR}/include"
+  "${OBS_QT_DIR}/include/QtCore"
+  "${OBS_QT_DIR}/include/QtGui"
+  "${OBS_QT_DIR}/include/QtNetwork"
+  "${OBS_QT_DIR}/include/QtWidgets"
 )
 target_link_directories(donationalerts_obs_provider PRIVATE
   "${OBS_BUILD_DIR}/libobs/Release"
   "${OBS_BUILD_DIR}/frontend/api/Release"
+  "${OBS_QT_DIR}/lib"
 )
 target_link_libraries(donationalerts_obs_provider PRIVATE
   obs
   obs-frontend-api
+  Qt6Widgets
+  Qt6Network
+  Qt6Gui
+  Qt6Core
   bcrypt
-  shell32
+  crypt32
   ws2_32
 )
 set_target_properties(donationalerts_obs_provider PROPERTIES
@@ -57,6 +75,9 @@ if(BUILD_TESTING)
   )
   target_compile_features(provider-server-tests PRIVATE cxx_std_20)
   target_compile_definitions(provider-server-tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  if(MSVC)
+    target_compile_options(provider-server-tests PRIVATE /utf-8)
+  endif()
   target_include_directories(provider-server-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(provider-server-tests PRIVATE bcrypt ws2_32)
   add_test(NAME provider-server COMMAND provider-server-tests)
@@ -66,4 +87,7 @@ include(GNUInstallDirs)
 install(TARGETS donationalerts_obs_provider
   RUNTIME DESTINATION "plugins/donationalerts-obs-provider/bin/64bit"
   LIBRARY DESTINATION "plugins/donationalerts-obs-provider/bin/64bit"
+)
+install(DIRECTORY data/locale
+  DESTINATION "plugins/donationalerts-obs-provider/data"
 )

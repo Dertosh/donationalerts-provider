@@ -41,46 +41,8 @@ struct HttpResponse {
 
 namespace {
 
-constexpr std::size_t kMaxRequestBytes = 16 * 1024;
+constexpr std::size_t kMaxRequestBytes = 256 * 1024;
 constexpr DWORD kSocketTimeoutMs = 1000;
-constexpr std::string_view kAdminHtml = R"html(<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DonationAlerts OBS Provider</title><style>
-body{font:16px system-ui;background:#15171c;color:#eee;max-width:760px;margin:40px auto;padding:0 20px}
-input,button{font:inherit;padding:10px;border-radius:6px;border:1px solid #555;background:#22252c;color:#eee}
-input[type=text],input[type=password]{width:min(100%,520px);box-sizing:border-box}button{cursor:pointer;background:#7048e8;border:0}
-label{display:block;margin:12px 0}.card{background:#20232b;border-radius:10px;padding:20px;margin:18px 0}
-small{display:block;color:#aaa;margin:6px 0 12px}.status{min-height:1.5em;color:#9be9a8}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #454851;padding:14px 0}
-</style></head><body><h1>DonationAlerts OBS Provider</h1>
-<section class="card"><h2>Административный ключ</h2><label>Ключ из журнала OBS
-<input id="admin" type="password" autocomplete="off"></label><button id="connect">Подключить</button>
-<p id="status" class="status"></p></section>
-<section class="card"><h2>Временный ключ виджета</h2><label>Название <input id="name" value="obs-widget" maxlength="80"></label>
-<label>Срок действия, минут <input id="lifetime" type="number" min="1" max="1440" value="60"></label>
-<label><input type="checkbox" name="scope" value="read:donation-events" checked> События донатов</label>
-<label><input type="checkbox" name="scope" value="read:goal-updates"> Обновления целей</label>
-<label><input type="checkbox" name="scope" value="read:poll-updates"> Обновления опросов</label>
-<button id="issue">Выпустить ключ</button><p id="issued" hidden></p></section>
-<section class="card"><h2>Активные ключи</h2><div id="tokens">Подключите панель.</div></section>
-<script>
-const admin=document.getElementById("admin"),status=document.getElementById("status"),tokens=document.getElementById("tokens");
-async function api(path,options={}){const r=await fetch(path,{...options,headers:{"X-Admin-Token":admin.value,...options.headers}});
-const data=await r.json();if(!r.ok)throw Error(data.error||`HTTP ${r.status}`);return data}
-function say(text){status.textContent=text}
-function render(items){tokens.replaceChildren();if(!items.length){tokens.textContent="Нет активных ключей.";return}
-for(const t of items){const row=document.createElement("div"),info=document.createElement("div"),name=document.createElement("strong"),small=document.createElement("small"),button=document.createElement("button");
-row.className="row";name.textContent=t.name;small.textContent=`Истекает ${new Date(t.expiresAt).toLocaleString()} · ${t.scopes.join(", ")} · ${t.id}`;
-button.textContent="Отозвать";button.onclick=async()=>{try{await api("/api/widget-tokens/revoke",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:t.id})});await refresh();say("Ключ отозван.")}catch(e){say(e.message)}};
-info.append(name,small);row.append(info,button);tokens.append(row)}}
-async function refresh(){render(await api("/api/widget-tokens"))}
-document.getElementById("connect").onclick=async()=>{try{await refresh();say("Подключено к локальному OBS-плагину.")}catch(e){say(e.message)}};
-document.getElementById("issue").onclick=async()=>{try{const scopes=[...document.querySelectorAll('input[name="scope"]:checked')].map(e=>e.value);
-const body=new URLSearchParams({name:document.getElementById("name").value,expiresInMinutes:document.getElementById("lifetime").value,scopes:scopes.join(",")});
-const result=await api("/api/widget-tokens",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body});
-const out=document.getElementById("issued");out.hidden=false;out.replaceChildren(document.createTextNode("Сохраните ключ — повторно он не отображается: "));
-const key=document.createElement("input");key.type="text";key.readOnly=true;key.value=result.token;out.append(key);await refresh();say("Временный ключ выпущен.")}catch(e){say(e.message)}};
-admin.addEventListener("keydown",e=>{if(e.key==="Enter")document.getElementById("connect").click()});
-</script></body></html>)html";
 
 struct WidgetToken {
 	std::string id;
@@ -499,6 +461,11 @@ std::int64_t current_time_ms()
 struct ProviderServer::State {
 	std::mutex mutex;
 	std::map<std::string, WidgetToken, std::less<>> tokens;
+	std::string oauth_code;
+	std::string oauth_state;
+	std::string oauth_error;
+	std::string profile_json = "null";
+	std::string donations_json = "[]";
 };
 
 ProviderServer::ProviderServer(std::uint16_t port)
@@ -631,18 +598,134 @@ void ProviderServer::run(std::stop_token stop_token)
 void ProviderServer::handle_request(std::uintptr_t client_socket, const HttpRequest &request, std::string_view origin)
 {
 	const SOCKET client = static_cast<SOCKET>(client_socket);
+	if (request.method == "GET" && request.path == "/oauth/callback") {
+		const auto query_start = request.target.find('?');
+		if (query_start == std::string::npos) {
+			send_response(client, {400, "text/plain; charset=utf-8", "Missing OAuth callback parameters."});
+			return;
+		}
+		const auto fields = parse_form(std::string_view(request.target).substr(query_start + 1));
+		if (!fields) {
+			send_response(client, {400, "text/plain; charset=utf-8", "Invalid OAuth callback parameters."});
+			return;
+		}
+		const auto code = fields->find("code");
+		const auto state = fields->find("state");
+		const auto error = fields->find("error");
+		if ((code == fields->end() || code->second.empty()) && error == fields->end()) {
+			send_response(client, {400, "text/plain; charset=utf-8", "Authorization code was not provided."});
+			return;
+		}
+		if ((code != fields->end() && code->second.size() > 4096) ||
+		    (state != fields->end() && state->second.size() > 256) ||
+		    (error != fields->end() && error->second.size() > 256)) {
+			send_response(client, {400, "text/plain; charset=utf-8", "OAuth callback parameters are too large."});
+			return;
+		}
+		{
+			std::lock_guard lock(state_->mutex);
+			state_->oauth_code = code == fields->end() ? std::string{} : code->second;
+			state_->oauth_state = state == fields->end() ? std::string{} : state->second;
+			state_->oauth_error = error == fields->end() ? std::string{} : error->second;
+		}
+		send_response(client, {200, "text/html; charset=utf-8",
+				       "<!doctype html><meta charset=utf-8><title>OBS</title>"
+				       "<p>Authorization received. Return to OBS.</p>",
+				       "Content-Security-Policy: default-src 'none'; base-uri 'none'\r\n"});
+		return;
+	}
+
 	if (request.method == "GET" && request.path == "/health") {
+		bool connected = false;
+		{
+			std::lock_guard lock(state_->mutex);
+			connected = state_->profile_json != "null";
+		}
 		send_response(client, {200, "application/json; charset=utf-8",
-				       "{\"ok\":true,\"service\":\"DonationAlerts OBS Provider\",\"donationAlertsConnected\":false}"},
+				       "{\"ok\":true,\"service\":\"DonationAlerts OBS Provider\",\"donationAlertsConnected\":" +
+					       std::string(connected ? "true}" : "false}")},
 			      origin);
 		return;
 	}
-	if (request.method == "GET" && (request.path == "/admin" || request.path == "/")) {
-		send_response(client, {200, "text/html; charset=utf-8", std::string(kAdminHtml),
-				       "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'\r\n"},
-			      origin);
+
+	if (request.path == "/api/oauth/callback-code") {
+		const auto admin_header = request.headers.find("x-admin-token");
+		if (admin_header == request.headers.end() || !constant_time_equal(admin_header->second, admin_token_)) {
+			send_response(client, {401, "application/json; charset=utf-8", json_error("A valid admin token is required.")},
+				      origin);
+			return;
+		}
+		if (request.method == "GET") {
+			std::string response;
+			{
+				std::lock_guard lock(state_->mutex);
+				response = "{\"code\":\"" + json_escape(state_->oauth_code) + "\",\"state\":\"" +
+					   json_escape(state_->oauth_state) + "\",\"error\":\"" +
+					   json_escape(state_->oauth_error) + "\"}";
+				state_->oauth_code.clear();
+				state_->oauth_state.clear();
+				state_->oauth_error.clear();
+			}
+			send_response(client, {200, "application/json; charset=utf-8", std::move(response)}, origin);
+			return;
+		}
+	}
+
+	if (request.path == "/api/provider/profile" || request.path == "/api/provider/donations") {
+		const auto admin_header = request.headers.find("x-admin-token");
+		if (admin_header == request.headers.end() || !constant_time_equal(admin_header->second, admin_token_)) {
+			send_response(client, {401, "application/json; charset=utf-8", json_error("A valid admin token is required.")},
+				      origin);
+			return;
+		}
+		if (request.method == "POST") {
+			const bool profile = request.path == "/api/provider/profile";
+			const bool valid_shape = profile ? (request.body == "null" ||
+								 (request.body.size() >= 2 && request.body.front() == '{' &&
+								  request.body.back() == '}'))
+							 : (request.body.size() >= 2 && request.body.front() == '[' &&
+							    request.body.back() == ']');
+			if (!valid_shape) {
+				send_response(client, {400, "application/json; charset=utf-8", json_error("Invalid provider data.")},
+					      origin);
+				return;
+			}
+			{
+				std::lock_guard lock(state_->mutex);
+				if (profile)
+					state_->profile_json = request.body;
+				else
+					state_->donations_json = request.body;
+			}
+			send_response(client, {204, "application/json; charset=utf-8", {}}, origin);
+			return;
+		}
+	}
+
+	if (request.method == "GET" && request.path == "/api/widget/data") {
+		const auto authorization = request.headers.find("authorization");
+		if (authorization == request.headers.end() || !authorization->second.starts_with("Bearer ")) {
+			send_response(client, {401, "application/json; charset=utf-8", json_error("A widget bearer token is required.")},
+				      origin);
+			return;
+		}
+		if (!authorize_widget(request, "read:donation-events")) {
+			send_response(client, {403, "application/json; charset=utf-8",
+					       json_error("This widget token does not have the donation-events scope.")},
+				      origin);
+			return;
+		}
+		{
+			std::lock_guard lock(state_->mutex);
+			const std::string response = "{\"connected\":" +
+				std::string(state_->profile_json == "null" ? "false" : "true") +
+				",\"profile\":" + state_->profile_json + ",\"donations\":" + state_->donations_json +
+				",\"goals\":[],\"polls\":[]}";
+			send_response(client, {200, "application/json; charset=utf-8", response}, origin);
+		}
 		return;
 	}
+
 	if (request.path == "/api/widget-tokens") {
 		const auto admin_header = request.headers.find("x-admin-token");
 		if (admin_header == request.headers.end() || !constant_time_equal(admin_header->second, admin_token_)) {
@@ -679,6 +762,23 @@ void ProviderServer::handle_request(std::uintptr_t client_socket, const HttpRequ
 		return;
 	}
 	send_response(client, {404, "application/json; charset=utf-8", json_error("Not found.")}, origin);
+}
+
+bool ProviderServer::authorize_widget(const HttpRequest &request, std::string_view required_scope)
+{
+	const auto authorization = request.headers.find("authorization");
+	if (authorization == request.headers.end() || !authorization->second.starts_with("Bearer "))
+		return false;
+	const auto token = std::string_view(authorization->second).substr(7);
+	if (token.empty())
+		return false;
+
+	std::lock_guard lock(state_->mutex);
+	const auto found = state_->tokens.find(sha256_hex(token));
+	if (found == state_->tokens.end() || found->second.expires_at_ms <= current_time_ms())
+		return false;
+	return std::find(found->second.scopes.begin(), found->second.scopes.end(), required_scope) !=
+	       found->second.scopes.end();
 }
 
 std::string ProviderServer::list_widget_tokens()

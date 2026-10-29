@@ -133,10 +133,21 @@ int main()
 	require(status_code(health) == 200 && response_body(health).find("\"ok\":true") != std::string_view::npos,
 		"health endpoint");
 	require(status_code(request(server, "GET", "/api/widget-tokens")) == 401, "reject unauthenticated admin request");
+	require(status_code(request(server, "GET", "/admin")) == 404, "do not expose a browser admin panel");
 	require(status_code(request(server, "GET", "/health", {}, {{"Origin", "https://not-local.example"}})) == 403,
 		"reject an untrusted browser origin");
 	require(status_code(request(server, "GET", "/health", {}, {}, kTestPort, "127.0.0.1:4043")) == 403,
 		"reject a mismatched Host header");
+	const auto callback = request(server, "GET", "/oauth/callback?code=auth-code-123&state=state-xyz", {},
+				      {{"Origin", "null"}});
+	require(status_code(callback) == 200, "accept the local OAuth callback");
+	const auto callback_data = request(server, "GET", "/api/oauth/callback-code", {},
+					   {{"X-Admin-Token", server.admin_token()},
+					    {"Origin", "http://127.0.0.1:4042"}});
+	require(status_code(callback_data) == 200 &&
+			response_body(callback_data).find("\"code\":\"auth-code-123\"") != std::string_view::npos &&
+			response_body(callback_data).find("\"state\":\"state-xyz\"") != std::string_view::npos,
+		"retrieve the OAuth callback only with admin authentication");
 
 	const auto invalid_scope = request(
 		server, "POST", "/api/widget-tokens", "name=test&expiresInMinutes=5&scopes=read%3Aadmin",
@@ -161,6 +172,40 @@ int main()
 	const auto id = json_string_field(issued_body, "id");
 	require(issued_body.find("ОБС test") != std::string_view::npos, "preserve UTF-8 token names");
 	require(token.size() == 64 && id.size() == 32, "return sufficiently random one-time token and ID");
+
+	const auto published_profile = request(
+		server, "POST", "/api/provider/profile", "{\"id\":123,\"name\":\"Streamer\"}", {},
+		kTestPort, "127.0.0.1:4042");
+	require(status_code(published_profile) == 401, "reject unauthenticated provider data updates");
+	const auto profile_update = request(
+		server, "POST", "/api/provider/profile", "{\"id\":123,\"name\":\"Streamer\"}", admin_headers(server));
+	require(status_code(profile_update) == 204, "publish the connected account profile");
+	const auto donations_update = request(server, "POST", "/api/provider/donations",
+					      "[{\"id\":987,\"username\":\"Viewer\",\"amount\":25,\"currency\":\"RUB\"}]",
+					      admin_headers(server));
+	require(status_code(donations_update) == 204, "publish donation data");
+	const auto widget_data = request(server, "GET", "/api/widget/data", {},
+					 {{"Authorization", "Bearer " + token},
+					  {"Origin", "http://127.0.0.1:4042"}});
+	require(status_code(widget_data) == 200 &&
+			response_body(widget_data).find("\"connected\":true") != std::string_view::npos &&
+			response_body(widget_data).find("\"name\":\"Streamer\"") != std::string_view::npos &&
+			response_body(widget_data).find("\"amount\":25") != std::string_view::npos,
+		"allow a scoped widget token to read the provider snapshot");
+	require(status_code(request(server, "GET", "/api/widget/data")) == 401,
+		"reject widget data requests without a bearer token");
+	const auto goal_token_response = request(
+		server, "POST", "/api/widget-tokens", "name=goals&expiresInMinutes=10&scopes=read%3Agoal-updates",
+		admin_headers(server));
+	require(status_code(goal_token_response) == 201, "issue a goal-only token");
+	const auto goal_token = json_string_field(response_body(goal_token_response), "token");
+	require(status_code(request(server, "GET", "/api/widget/data", {},
+				   {{"Authorization", "Bearer " + goal_token}})) == 403,
+		"do not expose donation data to a token without donation scope");
+	require(status_code(request(server, "POST", "/api/widget-tokens/revoke", "id=" +
+							  json_string_field(response_body(goal_token_response), "id"),
+					   admin_headers(server))) == 200,
+		"revoke the goal-only test token");
 
 	const auto listed = request(server, "GET", "/api/widget-tokens", {},
 				    {{"X-Admin-Token", server.admin_token()}, {"Origin", "http://127.0.0.1:4042"}});
