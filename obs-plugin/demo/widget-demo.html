@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>DonationAlerts Provider — тестовый виджет</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 16px/1.5 system-ui, sans-serif;
+      background: #11131a;
+      color: #eef0f6;
+    }
+
+    * { box-sizing: border-box; }
+
+    body { max-width: 860px; margin: 0 auto; padding: 28px 18px; }
+    h1, h2, p { margin-top: 0; }
+    h1 { font-size: 1.65rem; }
+    h2 { font-size: 1.1rem; margin-bottom: 12px; }
+    .card { background: #1c202b; border: 1px solid #343a49; border-radius: 12px; padding: 18px; margin: 16px 0; }
+    .controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+    input, button { min-height: 42px; border: 1px solid #454c5e; border-radius: 7px; padding: 9px 12px; font: inherit; }
+    input { min-width: 0; background: #11131a; color: inherit; }
+    button { cursor: pointer; background: #7654e8; color: white; border: 0; }
+    button.secondary { background: #343a49; }
+    button:disabled { cursor: wait; opacity: .65; }
+    .actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 10px; }
+    .status { min-height: 1.5em; margin: 12px 0 0; overflow-wrap: anywhere; }
+    .status[data-state="error"] { color: #ff9a9a; }
+    .status[data-state="ok"] { color: #94e6ac; }
+    .muted, .empty { color: #a7adbd; }
+    .profile { display: grid; gap: 4px; }
+    .spotlight {
+      min-height: 150px;
+      padding: 18px;
+      border: 1px solid #7654e8;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #29213f, #1c202b 65%);
+    }
+    .spotlight.show { animation: donation-arrive .45s ease-out; }
+    .spotlight-label { color: #b7a4ff; font-size: .8rem; font-weight: 800; letter-spacing: .08em; }
+    .spotlight-header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-top: 6px; }
+    .spotlight-donor { font-size: 1.5rem; }
+    .spotlight-amount { color: #b7a4ff; font-size: 1.4rem; font-weight: 800; }
+    .spotlight-message { margin: 12px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .spotlight-date { margin: 8px 0 0; color: #a7adbd; font-size: .9rem; }
+    @keyframes donation-arrive {
+      from { opacity: .35; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .spotlight.show { animation: none; }
+    }
+    .donation { padding: 12px 0; border-top: 1px solid #343a49; }
+    .donation:first-child { border-top: 0; padding-top: 0; }
+    .donation-header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 5px 16px; }
+    .amount { color: #b7a4ff; font-weight: 700; }
+    .message { margin: 5px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    @media (max-width: 540px) {
+      body { padding: 16px 12px; }
+      .controls { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Тестовый виджет DonationAlerts Provider</h1>
+    <p class="muted">Проверяет OAuth-подключение, историю и realtime WebSocket-события DonationAlerts через плагин OBS.</p>
+  </header>
+
+  <section class="card" aria-labelledby="connect-title">
+    <h2 id="connect-title">Подключение к плагину</h2>
+    <label for="widget-token">Временный ключ с доступом к событиям донатов</label>
+    <div class="controls">
+      <input id="widget-token" type="password" autocomplete="off" spellcheck="false"
+             placeholder="Вставьте ключ из панели OBS">
+      <button id="connect" type="button">Подключиться</button>
+    </div>
+    <div class="actions">
+      <button id="refresh" class="secondary" type="button" disabled>Обновить сейчас</button>
+      <button id="disconnect" class="secondary" type="button" disabled>Отключиться</button>
+    </div>
+    <p id="status" class="status" role="status" aria-live="polite" data-state="idle">Введите временный ключ.</p>
+    <p id="token-cache-status" class="status muted" role="status" aria-live="polite">Введённый ключ будет сохранён в браузере после подключения.</p>
+    <p id="socket-status" class="status muted" role="status" aria-live="polite">Realtime-сокет не подключён.</p>
+    <p class="muted">Можно передать ключ параметром <code>?token=...</code> в URL страницы. После загрузки он будет удалён из адресной строки, сохранён в локальном хранилище браузера и отправлен плагину. Любой, у кого есть доступ к профилю браузера, сможет получить этот ключ.</p>
+  </section>
+
+  <section class="card" aria-labelledby="profile-title">
+    <h2 id="profile-title">Аккаунт DonationAlerts</h2>
+    <div id="profile" class="profile empty">Нет данных. Сначала подключите плагин в OBS.</div>
+  </section>
+
+  <section class="card" aria-labelledby="donations-title">
+    <h2 id="donations-title">Событие нового доната</h2>
+    <article id="spotlight" class="spotlight" aria-live="polite">
+      <div id="spotlight-label" class="spotlight-label">ОЖИДАНИЕ НОВОГО ДОНАТА</div>
+      <div class="spotlight-header">
+        <strong id="spotlight-donor" class="spotlight-donor">Пока нет новых донатов</strong>
+        <span id="spotlight-amount" class="spotlight-amount"></span>
+      </div>
+      <p id="spotlight-message" class="spotlight-message">При появлении нового доната он будет показан здесь.</p>
+      <p id="spotlight-date" class="spotlight-date"></p>
+    </article>
+    <p class="muted">Уведомление поступает по WebSocket непосредственно из realtime-канала DonationAlerts. История ниже загружается отдельно через REST API.</p>
+    <h2>История донатов</h2>
+    <div id="donations" class="empty">Нет данных.</div>
+  </section>
+
+  <script>
+    "use strict";
+
+    const apiBase = "http://127.0.0.1:4041";
+    const eventSocketUrl = "ws://127.0.0.1:4043/api/widget/events";
+    const eventDisplayMs = 8000;
+    const tokenInput = document.getElementById("widget-token");
+    const connectButton = document.getElementById("connect");
+    const refreshButton = document.getElementById("refresh");
+    const disconnectButton = document.getElementById("disconnect");
+    const statusElement = document.getElementById("status");
+    const socketStatusElement = document.getElementById("socket-status");
+    const profileElement = document.getElementById("profile");
+    const donationsElement = document.getElementById("donations");
+    const spotlightElement = document.getElementById("spotlight");
+    const spotlightLabel = document.getElementById("spotlight-label");
+    const spotlightDonor = document.getElementById("spotlight-donor");
+    const spotlightAmount = document.getElementById("spotlight-amount");
+    const spotlightMessage = document.getElementById("spotlight-message");
+    const spotlightDate = document.getElementById("spotlight-date");
+    const tokenCacheStatus = document.getElementById("token-cache-status");
+    const tokenStorageKey = "donationalerts-provider.widget-token";
+    let eventTimerId = null;
+    let reconnectTimerId = null;
+    let requestInFlight = false;
+    let refreshQueued = false;
+    let pendingDonationEvents = [];
+    let eventSocket = null;
+
+    let tokenToConnect = null;
+    const pageUrl = new URL(window.location.href);
+    const pageToken = pageUrl.searchParams.get("token");
+    if (pageToken !== null) {
+      tokenInput.value = pageToken;
+      tokenToConnect = pageToken;
+      pageUrl.searchParams.delete("token");
+      try {
+        localStorage.setItem(tokenStorageKey, pageToken);
+        tokenCacheStatus.textContent = "Ключ сохранён в локальном хранилище этого браузера.";
+        tokenCacheStatus.dataset.state = "ok";
+      } catch (error) {
+        tokenCacheStatus.textContent = `Не удалось сохранить ключ в браузере: ${error.message}`;
+        tokenCacheStatus.dataset.state = "error";
+      }
+      try {
+        window.history.replaceState(null, "", pageUrl);
+      } catch (error) {
+        tokenCacheStatus.textContent += ` Не удалось убрать ключ из адреса: ${error.message}`;
+        tokenCacheStatus.dataset.state = "error";
+      }
+    } else {
+      try {
+        const cachedToken = localStorage.getItem(tokenStorageKey);
+        if (cachedToken !== null) {
+          tokenInput.value = cachedToken;
+          tokenToConnect = cachedToken;
+          tokenCacheStatus.textContent = "Ключ восстановлен из локального хранилища этого браузера.";
+          tokenCacheStatus.dataset.state = "ok";
+        }
+      } catch (error) {
+        tokenCacheStatus.textContent = `Не удалось прочитать ключ из браузера: ${error.message}`;
+        tokenCacheStatus.dataset.state = "error";
+      }
+    }
+
+    function setStatus(message, state) {
+      statusElement.textContent = message;
+      statusElement.dataset.state = state;
+    }
+
+    function setSocketStatus(message, state = "idle") {
+      socketStatusElement.textContent = message;
+      socketStatusElement.dataset.state = state;
+    }
+
+    function setConnected(connected) {
+      refreshButton.disabled = !connected;
+      disconnectButton.disabled = !connected;
+      connectButton.disabled = connected;
+      tokenInput.disabled = connected;
+    }
+
+    function formatDate(value) {
+      if (!value) return "Дата не указана";
+      const date = new Date(String(value).replace(" ", "T"));
+      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+    }
+
+    function showWaitingForDonation() {
+      spotlightLabel.textContent = "ОЖИДАНИЕ НОВОГО ДОНАТА";
+      spotlightDonor.textContent = "Пока нет новых донатов";
+      spotlightAmount.textContent = "";
+      spotlightMessage.textContent = "При появлении нового доната он будет показан здесь.";
+      spotlightDate.textContent = "";
+      spotlightElement.classList.remove("show");
+    }
+
+    function showDonationEvent(donation) {
+      spotlightLabel.textContent = "НОВЫЙ ДОНАТ";
+      spotlightDonor.textContent = donation.username || donation.name || "Аноним";
+      spotlightAmount.textContent = `${donation.amount ?? ""} ${donation.currency || ""}`.trim();
+      spotlightMessage.textContent = donation.message || "Без сообщения";
+      spotlightDate.textContent = formatDate(donation.created_at);
+      spotlightElement.classList.remove("show");
+      void spotlightElement.offsetWidth;
+      spotlightElement.classList.add("show");
+    }
+
+    function showNextDonationEvent() {
+      if (pendingDonationEvents.length === 0) {
+        eventTimerId = null;
+        showWaitingForDonation();
+        return;
+      }
+
+      showDonationEvent(pendingDonationEvents.shift());
+      eventTimerId = setTimeout(showNextDonationEvent, eventDisplayMs);
+    }
+
+    function renderProfile(profile) {
+      profileElement.replaceChildren();
+      profileElement.classList.toggle("empty", !profile);
+      if (!profile) {
+        profileElement.textContent = "Плагин подключён, но аккаунт DonationAlerts ещё не подключён.";
+        return;
+      }
+
+      const name = document.createElement("strong");
+      name.textContent = profile.name || profile.code || "DonationAlerts";
+      const code = document.createElement("span");
+      code.textContent = profile.code ? `Логин: ${profile.code}` : "";
+      const id = document.createElement("span");
+      id.textContent = profile.id !== undefined ? `ID аккаунта: ${profile.id}` : "";
+      profileElement.append(name, code, id);
+    }
+
+    function renderDonations(donations) {
+      donationsElement.replaceChildren();
+      donationsElement.classList.toggle("empty", donations.length === 0);
+      if (donations.length === 0) {
+        donationsElement.textContent = "Донатов в доступной истории пока нет.";
+        return;
+      }
+
+      for (const donation of donations) {
+        const row = document.createElement("article");
+        row.className = "donation";
+        const header = document.createElement("div");
+        header.className = "donation-header";
+        const donor = document.createElement("strong");
+        donor.textContent = donation.username || donation.name || "Аноним";
+        const amount = document.createElement("span");
+        amount.className = "amount";
+        amount.textContent = `${donation.amount ?? ""} ${donation.currency || ""}`.trim();
+        const date = document.createElement("time");
+        date.className = "muted";
+        date.dateTime = donation.created_at || "";
+        date.textContent = formatDate(donation.created_at);
+        header.append(donor, amount, date);
+        row.append(header);
+
+        if (donation.message) {
+          const message = document.createElement("p");
+          message.className = "message";
+          message.textContent = donation.message;
+          row.append(message);
+        }
+        donationsElement.append(row);
+      }
+    }
+
+    function updateDonations(donations) {
+      const currentDonations = donations
+        .map((donation, index) => ({ donation, index }))
+        .sort((left, right) => {
+          const leftTime = Date.parse(String(left.donation.created_at || "").replace(" ", "T"));
+          const rightTime = Date.parse(String(right.donation.created_at || "").replace(" ", "T"));
+          const leftHasTime = !Number.isNaN(leftTime);
+          const rightHasTime = !Number.isNaN(rightTime);
+          if (leftHasTime && rightHasTime && leftTime !== rightTime) return rightTime - leftTime;
+          if (leftHasTime !== rightHasTime) return leftHasTime ? -1 : 1;
+          return left.index - right.index;
+        })
+        .map(entry => entry.donation);
+
+      renderDonations(currentDonations);
+    }
+
+    function normalizeDonation(value) {
+      let donation = value;
+      for (let depth = 0; depth < 5 && donation && typeof donation === "object"; depth += 1) {
+        if ("amount" in donation) return donation;
+        donation = donation.donation || donation.data || donation.payload ||
+          donation.alert || donation.info || donation.event || donation.raw;
+      }
+      return value && typeof value === "object" ? value : null;
+    }
+
+    function onDonationEvent(event) {
+      if (event.type === "status") {
+        setSocketStatus(
+          event.connected ? "WebSocket подключён; ожидаю события DonationAlerts…" :
+            (event.message || "Realtime-канал DonationAlerts пока не подключён."),
+          event.connected ? "ok" : "error"
+        );
+        return;
+      }
+      if (event.type !== "donation") return;
+      const donation = normalizeDonation(event.donation || event.data || event);
+      if (!donation) {
+        setSocketStatus("Получено событие, но формат доната не распознан.", "error");
+        return;
+      }
+      pendingDonationEvents.push(donation);
+      void refreshData();
+      if (eventTimerId === null) showNextDonationEvent();
+    }
+
+    function connectEventSocket() {
+      if (!connectButton.disabled || eventSocket !== null) return;
+      const token = tokenInput.value.trim();
+      if (!token) return;
+      setSocketStatus("Подключаю realtime WebSocket к локальному плагину…");
+
+      let socket;
+      try {
+        socket = new WebSocket(eventSocketUrl, ["donationalerts-widget-v1", token]);
+      } catch (error) {
+        setSocketStatus(`Не удалось создать WebSocket: ${error.message}`, "error");
+        return;
+      }
+      eventSocket = socket;
+      socket.addEventListener("open", () => {
+        if (eventSocket === socket)
+          setSocketStatus("WebSocket подключён; ожидаю события DonationAlerts…", "ok");
+      });
+      socket.addEventListener("message", message => {
+        if (eventSocket !== socket) return;
+        try {
+          onDonationEvent(JSON.parse(message.data));
+        } catch {
+          setSocketStatus("Плагин прислал некорректное WebSocket-событие.", "error");
+        }
+      });
+      socket.addEventListener("error", () => {
+        if (eventSocket === socket)
+          setSocketStatus("Ошибка WebSocket. Проверяю соединение с локальным плагином…", "error");
+      });
+      socket.addEventListener("close", event => {
+        if (eventSocket !== socket) return;
+        eventSocket = null;
+        const reason = event.reason ? ` Причина: ${event.reason}` : "";
+        const closeDetails = ` (код ${event.code}${event.wasClean ? ", закрыт штатно" : ", соединение оборвано"})`;
+        setSocketStatus(`WebSocket отключён${closeDetails}.${reason} Повторное подключение через 3 секунды.`, "error");
+        if (connectButton.disabled) {
+          reconnectTimerId = setTimeout(() => {
+            reconnectTimerId = null;
+            connectEventSocket();
+          }, 3000);
+        }
+      });
+    }
+
+    function disconnectEventSocket() {
+      if (reconnectTimerId !== null) clearTimeout(reconnectTimerId);
+      if (eventTimerId !== null) clearTimeout(eventTimerId);
+      reconnectTimerId = null;
+      eventTimerId = null;
+      pendingDonationEvents = [];
+      const socket = eventSocket;
+      eventSocket = null;
+      if (socket !== null) socket.close();
+      showWaitingForDonation();
+      setSocketStatus("Realtime-сокет не подключён.");
+    }
+
+    async function refreshData() {
+      if (requestInFlight) {
+        refreshQueued = true;
+        return;
+      }
+      const token = tokenInput.value.trim();
+      if (!token) {
+        setStatus("Введите временный ключ.", "error");
+        return;
+      }
+
+      requestInFlight = true;
+      refreshButton.disabled = true;
+      setStatus("Запрашиваю данные у локального плагина…", "idle");
+      try {
+        const headers = { Authorization: `Bearer ${token}` };
+        const [profileResponse, donationsResponse] = await Promise.all([
+          fetch(`${apiBase}/api/v1/user/oauth`, {
+            method: "GET",
+            cache: "no-store",
+            headers
+          }),
+          fetch(`${apiBase}/api/v1/alerts/donations?per_page=30`, {
+            method: "GET",
+            cache: "no-store",
+            headers
+          })
+        ]);
+        const [profileBody, donationsBody] = await Promise.all([
+          profileResponse.json().catch(() => ({})),
+          donationsResponse.json().catch(() => ({}))
+        ]);
+        if (!profileResponse.ok) {
+          throw new Error(profileBody.error || `HTTP ${profileResponse.status}`);
+        }
+        if (!donationsResponse.ok) {
+          throw new Error(donationsBody.error || `HTTP ${donationsResponse.status}`);
+        }
+        if (!Array.isArray(donationsBody.data)) {
+          throw new Error("DonationAlerts вернул некорректный список донатов.");
+        }
+
+        renderProfile(profileBody.data || null);
+        updateDonations(donationsBody.data);
+        const updatedAt = new Date().toLocaleTimeString();
+        setStatus(`Связь с плагином работает. Обновлено ${updatedAt}.`, "ok");
+      } catch (error) {
+        refreshQueued = false;
+        if (error.message === "This widget token does not have the donation-events scope.") {
+          tokenInput.value = "";
+          try {
+            localStorage.removeItem(tokenStorageKey);
+            tokenCacheStatus.textContent = "Ключ без доступа к событиям удалён из локального хранилища. Выпустите новый ключ.";
+            tokenCacheStatus.dataset.state = "error";
+          } catch (storageError) {
+            tokenCacheStatus.textContent = `Не удалось удалить ключ из браузера: ${storageError.message}`;
+            tokenCacheStatus.dataset.state = "error";
+          }
+          setStatus("У ключа нет доступа к событиям донатов. Выпустите новый ключ в панели OBS с включённым пунктом «События донатов», затем вставьте его сюда. Права уже выпущенного ключа изменить нельзя.", "error");
+        } else {
+          setStatus(`Ошибка подключения: ${error.message}. Убедитесь, что OBS запущен, плагин загружен, а ключ действителен и имеет доступ к донатам.`, "error");
+        }
+        disconnectEventSocket();
+        setConnected(false);
+      } finally {
+        requestInFlight = false;
+        if (connectButton.disabled) refreshButton.disabled = false;
+        if (refreshQueued && connectButton.disabled) {
+          refreshQueued = false;
+          void refreshData();
+        }
+      }
+    }
+
+    connectButton.addEventListener("click", async () => {
+      const token = tokenInput.value.trim();
+      if (!token) {
+        setStatus("Сначала вставьте временный ключ из панели OBS.", "error");
+        tokenInput.focus();
+        return;
+      }
+      try {
+        localStorage.setItem(tokenStorageKey, token);
+        tokenCacheStatus.textContent = "Ключ сохранён в локальном хранилище этого браузера.";
+        tokenCacheStatus.dataset.state = "ok";
+      } catch (error) {
+        tokenCacheStatus.textContent = `Не удалось сохранить ключ в браузере: ${error.message}`;
+        tokenCacheStatus.dataset.state = "error";
+      }
+      setConnected(true);
+      await refreshData();
+      if (statusElement.dataset.state === "ok")
+        connectEventSocket();
+    });
+
+    refreshButton.addEventListener("click", refreshData);
+    disconnectButton.addEventListener("click", () => {
+      refreshQueued = false;
+      disconnectEventSocket();
+      tokenInput.value = "";
+      try {
+        localStorage.removeItem(tokenStorageKey);
+        tokenCacheStatus.textContent = "Сохранённый ключ удалён из локального хранилища браузера.";
+        tokenCacheStatus.dataset.state = "idle";
+      } catch (error) {
+        tokenCacheStatus.textContent = `Не удалось удалить ключ из браузера: ${error.message}`;
+        tokenCacheStatus.dataset.state = "error";
+      }
+      setConnected(false);
+      renderProfile(null);
+      renderDonations([]);
+      setStatus("Отключено. Ключ удалён из поля страницы.", "idle");
+    });
+
+    if (tokenToConnect) connectButton.click();
+  </script>
+</body>
+</html>

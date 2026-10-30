@@ -4,7 +4,7 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 
-#include <QDockWidget>
+#include <QPointer>
 #include <QWidget>
 
 #include <memory>
@@ -17,19 +17,15 @@ OBS_MODULE_USE_DEFAULT_LOCALE("donationalerts-obs-provider", "en-US")
 namespace {
 
 std::unique_ptr<ProviderServer> provider;
-constexpr char kDockId[] = "donationalertsProviderDock";
-bool dock_registered = false;
+QPointer<ProviderPanel> panel;
 
 void open_provider_panel(void *)
 {
-	auto *main_window = static_cast<QWidget *>(obs_frontend_get_main_window());
-	if (!main_window)
+	if (!panel)
 		return;
-	auto *dock = main_window->findChild<QDockWidget *>(QString::fromLatin1(kDockId));
-	if (dock) {
-		dock->show();
-		dock->raise();
-	}
+	panel->show();
+	panel->raise();
+	panel->activateWindow();
 }
 
 } // namespace
@@ -44,17 +40,17 @@ bool obs_module_load(void)
 			return false;
 		}
 
-		auto *panel = new ProviderPanel(instance->admin_token());
-		if (!obs_frontend_add_dock_by_id(kDockId, obs_module_text("Panel.Title"), panel)) {
-			delete panel;
+		auto *main_window = static_cast<QWidget *>(obs_frontend_get_main_window());
+		if (!main_window) {
 			instance->stop();
-			blog(LOG_ERROR, "[DonationAlerts Provider] Could not register the OBS dock.");
+			blog(LOG_ERROR, "[DonationAlerts Provider] Could not get the OBS main window.");
 			return false;
 		}
-		dock_registered = true;
+		panel = new ProviderPanel(instance->admin_token());
+		panel->setParent(main_window, Qt::Window);
+		panel->hide();
 		provider = std::move(instance);
-		blog(LOG_INFO, "[DonationAlerts Provider] Local API listening on 127.0.0.1:4041; OBS dock registered.");
-		blog(LOG_INFO, "[DonationAlerts Provider] DonationAlerts OAuth is not configured yet.");
+		blog(LOG_INFO, "[DonationAlerts Provider] Local API listening on 127.0.0.1:4041; settings window registered.");
 		obs_frontend_add_tools_menu_item(obs_module_text("Menu.OpenPanel"), open_provider_panel, nullptr);
 		return true;
 	} catch (const std::exception &error) {
@@ -65,10 +61,8 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
-	if (dock_registered) {
-		obs_frontend_remove_dock(kDockId);
-		dock_registered = false;
-	}
+	delete panel.data();
+	panel = nullptr;
 	if (provider) {
 		provider->stop();
 		provider.reset();

@@ -4,6 +4,8 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <array>
@@ -14,6 +16,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -41,8 +45,29 @@ struct HttpResponse {
 
 namespace {
 
+class WinHttpHandle {
+public:
+	explicit WinHttpHandle(HINTERNET handle = nullptr) : handle_(handle) {}
+	~WinHttpHandle()
+	{
+		if (handle_)
+			WinHttpCloseHandle(handle_);
+	}
+	WinHttpHandle(const WinHttpHandle &) = delete;
+	WinHttpHandle &operator=(const WinHttpHandle &) = delete;
+	HINTERNET get() const { return handle_; }
+
+private:
+	HINTERNET handle_;
+};
+
 constexpr std::size_t kMaxRequestBytes = 256 * 1024;
+constexpr std::size_t kMaxWebSocketFrameBytes = 1024 * 1024;
+constexpr std::size_t kMaxWidgetEventClients = 32;
 constexpr DWORD kSocketTimeoutMs = 1000;
+constexpr DWORD kUpstreamTimeoutMs = 10000;
+constexpr std::string_view kWebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+constexpr wchar_t kDonationAlertsApiHost[] = L"www.donationalerts.com";
 
 struct WidgetToken {
 	std::string id;
@@ -51,12 +76,86 @@ struct WidgetToken {
 	std::int64_t expires_at_ms;
 };
 
+std::string json_error(std::string_view message);
+
 std::string lower_ascii(std::string value)
 {
 	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
 		return static_cast<char>(std::tolower(ch));
 	});
 	return value;
+}
+
+std::optional<std::wstring> utf8_to_wide(std::string_view value)
+{
+	if (value.empty())
+		return std::wstring{};
+	const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+					       static_cast<int>(value.size()), nullptr, 0);
+	if (length <= 0)
+		return std::nullopt;
+	std::wstring wide(static_cast<std::size_t>(length), L'\0');
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+				wide.data(), length) != length)
+		return std::nullopt;
+	return wide;
+}
+
+HttpResponse proxy_donationalerts_get(std::string_view target, std::string_view access_token)
+{
+	if (target.empty() || target.size() > 4096 ||
+	    std::any_of(target.begin(), target.end(), [](unsigned char ch) { return ch <= 0x20 || ch == 0x7f; }))
+		return {400, "application/json; charset=utf-8", json_error("The API request target is invalid.")};
+	const auto wide_target = utf8_to_wide(target);
+	if (!wide_target)
+		return {400, "application/json; charset=utf-8", json_error("The API request target is not valid UTF-8.")};
+
+	WinHttpHandle session(WinHttpOpen(L"DonationAlerts OBS Provider/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+					 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+	if (!session.get())
+		return {502, "application/json; charset=utf-8", json_error("Could not initialize the DonationAlerts API proxy.")};
+	WinHttpSetTimeouts(session.get(), kUpstreamTimeoutMs, kUpstreamTimeoutMs, kUpstreamTimeoutMs,
+			   kUpstreamTimeoutMs);
+	WinHttpHandle connection(WinHttpConnect(session.get(), kDonationAlertsApiHost, INTERNET_DEFAULT_HTTPS_PORT, 0));
+	if (!connection.get())
+		return {502, "application/json; charset=utf-8", json_error("Could not connect to DonationAlerts.")};
+	WinHttpHandle request(WinHttpOpenRequest(connection.get(), L"GET", wide_target->c_str(), nullptr,
+						 WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
+	if (!request.get())
+		return {502, "application/json; charset=utf-8", json_error("Could not create the DonationAlerts API request.")};
+
+	std::wstring headers = L"Authorization: Bearer ";
+	for (const unsigned char ch : access_token)
+		headers.push_back(static_cast<wchar_t>(ch));
+	headers += L"\r\nAccept: application/json\r\n";
+	if (!WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(headers.size()),
+				WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+	    !WinHttpReceiveResponse(request.get(), nullptr))
+		return {502, "application/json; charset=utf-8", json_error("The DonationAlerts API request failed.")};
+
+	DWORD status = 0;
+	DWORD status_size = sizeof(status);
+	if (!WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+				 WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX))
+		return {502, "application/json; charset=utf-8", json_error("Could not read the DonationAlerts API response.")};
+
+	std::string body;
+	for (;;) {
+		DWORD available = 0;
+		if (!WinHttpQueryDataAvailable(request.get(), &available))
+			return {502, "application/json; charset=utf-8", json_error("Could not read the DonationAlerts API response.")};
+		if (available == 0)
+			break;
+		if (body.size() + available > 2 * 1024 * 1024)
+			return {502, "application/json; charset=utf-8", json_error("The DonationAlerts API response is too large.")};
+		const auto offset = body.size();
+		body.resize(offset + available);
+		DWORD received = 0;
+		if (!WinHttpReadData(request.get(), body.data() + offset, available, &received))
+			return {502, "application/json; charset=utf-8", json_error("Could not read the DonationAlerts API response.")};
+		body.resize(offset + received);
+	}
+	return {static_cast<int>(status), "application/json; charset=utf-8", std::move(body)};
 }
 
 std::string trim(std::string value)
@@ -111,6 +210,31 @@ bool valid_utf8(std::string_view value)
 		index += count;
 	}
 	return true;
+}
+
+bool valid_widget_origin(std::string_view origin)
+{
+	if (origin.empty() || origin == "null")
+		return true;
+	if (origin.size() > 512 ||
+	    std::any_of(origin.begin(), origin.end(), [](unsigned char ch) {
+		    return ch <= 0x20 || ch == 0x7f || ch == '\\';
+	    }))
+		return false;
+	const auto authority_start = origin.find("://");
+	if (authority_start == std::string_view::npos)
+		return false;
+	const auto scheme = origin.substr(0, authority_start);
+	if (scheme != "http" && scheme != "https")
+		return false;
+	const auto authority = origin.substr(authority_start + 3);
+	return !authority.empty() && authority.find_first_of("/?#@") == std::string_view::npos;
+}
+
+bool allows_widget_origin(std::string_view path)
+{
+	return path == "/api/widget/data" || path == "/api/v1/user/oauth" ||
+	       path == "/api/v1/alerts/donations";
 }
 
 std::string limit_utf8_characters(std::string_view value, std::size_t limit)
@@ -416,9 +540,10 @@ void send_response(SOCKET client, const HttpResponse &response, std::string_view
 {
 	static const std::map<int, std::string_view> reason = {
 		{200, "OK"}, {201, "Created"}, {204, "No Content"}, {400, "Bad Request"},
-		{401, "Unauthorized"}, {403, "Forbidden"}, {404, "Not Found"},
+		{401, "Unauthorized"}, {403, "Forbidden"}, {404, "Not Found"}, {405, "Method Not Allowed"},
 		{409, "Conflict"}, {413, "Payload Too Large"}, {415, "Unsupported Media Type"},
-		{429, "Too Many Requests"},
+		{422, "Unprocessable Entity"}, {429, "Too Many Requests"},
+		{502, "Bad Gateway"},
 		{500, "Internal Server Error"}, {503, "Service Unavailable"}
 	};
 	const auto found = reason.find(response.status);
@@ -449,6 +574,129 @@ void send_response(SOCKET client, const HttpResponse &response, std::string_view
 	send_all(response.body.data(), response.body.size());
 }
 
+std::string websocket_accept(std::string_view key)
+{
+	const std::string input = std::string(key) + std::string(kWebSocketGuid);
+	BCRYPT_ALG_HANDLE algorithm = nullptr;
+	if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA1_ALGORITHM, nullptr, 0) != 0)
+		throw std::runtime_error("Unable to initialize WebSocket handshake hash.");
+	BCRYPT_HASH_HANDLE hash = nullptr;
+	if (BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) != 0) {
+		BCryptCloseAlgorithmProvider(algorithm, 0);
+		throw std::runtime_error("Unable to create WebSocket handshake hash.");
+	}
+	std::array<UCHAR, 20> digest{};
+	const bool success = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char *>(input.data())),
+					    static_cast<ULONG>(input.size()), 0) == 0 &&
+			     BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) == 0;
+	BCryptDestroyHash(hash);
+	BCryptCloseAlgorithmProvider(algorithm, 0);
+	if (!success)
+		throw std::runtime_error("Unable to calculate WebSocket handshake hash.");
+
+	DWORD encoded_size = 0;
+	if (!CryptBinaryToStringA(digest.data(), static_cast<DWORD>(digest.size()),
+				  CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &encoded_size))
+		throw std::runtime_error("Unable to encode WebSocket handshake hash.");
+	std::string encoded(encoded_size, '\0');
+	if (!CryptBinaryToStringA(digest.data(), static_cast<DWORD>(digest.size()),
+				  CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, encoded.data(), &encoded_size))
+		throw std::runtime_error("Unable to encode WebSocket handshake hash.");
+	encoded.resize(encoded_size);
+	return encoded;
+}
+
+bool websocket_send(SOCKET client, std::uint8_t opcode, std::string_view payload)
+{
+	std::string frame;
+	frame.reserve(payload.size() + 10);
+	frame.push_back(static_cast<char>(0x80 | (opcode & 0x0f)));
+	if (payload.size() < 126) {
+		frame.push_back(static_cast<char>(payload.size()));
+	} else if (payload.size() <= std::numeric_limits<std::uint16_t>::max()) {
+		frame.push_back(static_cast<char>(126));
+		frame.push_back(static_cast<char>((payload.size() >> 8) & 0xff));
+		frame.push_back(static_cast<char>(payload.size() & 0xff));
+	} else {
+		frame.push_back(static_cast<char>(127));
+		for (int shift = 56; shift >= 0; shift -= 8)
+			frame.push_back(static_cast<char>((static_cast<std::uint64_t>(payload.size()) >> shift) & 0xff));
+	}
+	frame.append(payload);
+	const char *data = frame.data();
+	std::size_t remaining = frame.size();
+	while (remaining > 0) {
+		const int sent = send(client, data, static_cast<int>(std::min<std::size_t>(remaining, INT_MAX)), 0);
+		if (sent <= 0)
+			return false;
+		data += sent;
+		remaining -= static_cast<std::size_t>(sent);
+	}
+	return true;
+}
+
+struct WidgetEventClient {
+	SOCKET socket = INVALID_SOCKET;
+	std::string token_hash;
+	std::vector<std::uint8_t> input;
+};
+
+bool process_websocket_frames(WidgetEventClient &client)
+{
+	for (;;) {
+		if (client.input.size() < 2)
+			return true;
+		const auto first = client.input[0];
+		const auto second = client.input[1];
+		const auto opcode = static_cast<std::uint8_t>(first & 0x0f);
+		if ((first & 0x70) != 0)
+			return false;
+		std::uint64_t payload_size = second & 0x7f;
+		std::size_t header_size = 2;
+		if (payload_size == 126) {
+			if (client.input.size() < 4)
+				return true;
+			payload_size = (static_cast<std::uint64_t>(client.input[2]) << 8) | client.input[3];
+			header_size = 4;
+		} else if (payload_size == 127) {
+			if (client.input.size() < 10)
+				return true;
+			payload_size = 0;
+			for (std::size_t index = 2; index < 10; ++index)
+				payload_size = (payload_size << 8) | client.input[index];
+			header_size = 10;
+		}
+		const bool masked = (second & 0x80) != 0;
+		if (!masked || payload_size > kMaxWebSocketFrameBytes)
+			return false;
+		const std::size_t mask_offset = header_size;
+		header_size += 4;
+		if (client.input.size() < header_size + payload_size)
+			return true;
+		if (opcode == 0x8)
+			return false;
+		if (opcode == 0x9) {
+			std::string pong(static_cast<std::size_t>(payload_size), '\0');
+			for (std::size_t index = 0; index < payload_size; ++index)
+				pong[index] = static_cast<char>(client.input[header_size + index] ^
+								client.input[mask_offset + index % 4]);
+			if (!websocket_send(client.socket, 0xA, pong))
+				return false;
+		}
+		client.input.erase(client.input.begin(),
+				   client.input.begin() + static_cast<std::ptrdiff_t>(header_size + payload_size));
+	}
+}
+
+void close_event_client(WidgetEventClient &client)
+{
+	if (client.socket != INVALID_SOCKET) {
+		shutdown(client.socket, SD_BOTH);
+		closesocket(client.socket);
+		client.socket = INVALID_SOCKET;
+	}
+}
+
 std::int64_t current_time_ms()
 {
 	return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -456,20 +704,101 @@ std::int64_t current_time_ms()
 		.count();
 }
 
+std::wstring default_token_store_path()
+{
+	const DWORD required = GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
+	if (required == 0)
+		return {};
+	std::wstring appdata(required, L'\0');
+	const DWORD written = GetEnvironmentVariableW(L"APPDATA", appdata.data(), required);
+	if (written == 0 || written >= required)
+		return {};
+	appdata.resize(written);
+	return (std::filesystem::path(appdata) / L"obs-studio" / L"plugin_config" /
+		L"donationalerts-obs-provider-tokens.dat").wstring();
+}
+
+void append_u32(std::string &output, std::uint32_t value)
+{
+	for (unsigned int shift = 0; shift < 32; shift += 8)
+		output.push_back(static_cast<char>((value >> shift) & 0xff));
+}
+
+void append_u64(std::string &output, std::uint64_t value)
+{
+	for (unsigned int shift = 0; shift < 64; shift += 8)
+		output.push_back(static_cast<char>((value >> shift) & 0xff));
+}
+
+bool read_u32(std::string_view input, std::size_t &position, std::uint32_t &value)
+{
+	if (position > input.size() || input.size() - position < 4)
+		return false;
+	value = 0;
+	for (unsigned int shift = 0; shift < 32; shift += 8)
+		value |= static_cast<std::uint32_t>(static_cast<unsigned char>(input[position++])) << shift;
+	return true;
+}
+
+bool read_u64(std::string_view input, std::size_t &position, std::uint64_t &value)
+{
+	if (position > input.size() || input.size() - position < 8)
+		return false;
+	value = 0;
+	for (unsigned int shift = 0; shift < 64; shift += 8)
+		value |= static_cast<std::uint64_t>(static_cast<unsigned char>(input[position++])) << shift;
+	return true;
+}
+
+bool append_string(std::string &output, std::string_view value)
+{
+	if (value.size() > std::numeric_limits<std::uint32_t>::max())
+		return false;
+	append_u32(output, static_cast<std::uint32_t>(value.size()));
+	output.append(value);
+	return true;
+}
+
+bool read_string(std::string_view input, std::size_t &position, std::string &value, std::size_t max_size)
+{
+	std::uint32_t size = 0;
+	if (!read_u32(input, position, size) || size > max_size || position > input.size() ||
+	    input.size() - position < size)
+		return false;
+	value.assign(input.substr(position, size));
+	position += size;
+	return true;
+}
+
+bool is_hex_string(std::string_view value)
+{
+	return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+		return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+	});
+}
+
 } // namespace
 
 struct ProviderServer::State {
 	std::mutex mutex;
 	std::map<std::string, WidgetToken, std::less<>> tokens;
+	std::deque<std::string> donation_events;
+	std::string realtime_status_json =
+		"{\"type\":\"status\",\"connected\":false,\"message\":\"Realtime stream is not connected.\"}";
 	std::string oauth_code;
 	std::string oauth_state;
 	std::string oauth_error;
+	std::string upstream_access_token;
 	std::string profile_json = "null";
 	std::string donations_json = "[]";
 };
 
-ProviderServer::ProviderServer(std::uint16_t port)
-	: state_(std::make_unique<State>()), port_(port), admin_token_(random_hex(32)), listener_(INVALID_SOCKET)
+ProviderServer::ProviderServer(std::uint16_t port, std::wstring token_store_path, std::uint16_t widget_events_port,
+			       std::function<std::int64_t()> clock)
+	: state_(std::make_unique<State>()), port_(port), widget_events_port_(widget_events_port),
+	  token_store_path_(token_store_path.empty() ? default_token_store_path() : std::move(token_store_path)),
+	  clock_(clock ? std::move(clock) : std::function<std::int64_t()>(current_time_ms)),
+	  admin_token_(random_hex(32)), listener_(INVALID_SOCKET), event_listener_(INVALID_SOCKET)
 {
 }
 
@@ -487,6 +816,8 @@ bool ProviderServer::start(std::string &error)
 {
 	if (worker_.joinable())
 		return true;
+	if (!load_widget_tokens(error))
+		return false;
 
 	WSADATA winsock_data{};
 	const int startup_result = WSAStartup(MAKEWORD(2, 2), &winsock_data);
@@ -516,8 +847,31 @@ bool ProviderServer::start(std::string &error)
 		return false;
 	}
 
+	SOCKET event_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (event_listener == INVALID_SOCKET) {
+		const int socket_error = WSAGetLastError();
+		closesocket(listener);
+		WSACleanup();
+		error = "Unable to create the widget WebSocket listener (Winsock " +
+			std::to_string(socket_error) + ").";
+		return false;
+	}
+	address.sin_port = htons(widget_events_port_);
+	if (bind(event_listener, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == SOCKET_ERROR ||
+	    listen(event_listener, SOMAXCONN) == SOCKET_ERROR) {
+		const int socket_error = WSAGetLastError();
+		closesocket(event_listener);
+		closesocket(listener);
+		WSACleanup();
+		error = "Unable to bind widget WebSocket to 127.0.0.1:" + std::to_string(widget_events_port_) +
+			" (Winsock " + std::to_string(socket_error) + ").";
+		return false;
+	}
+
 	listener_.store(static_cast<std::uintptr_t>(listener));
+	event_listener_.store(static_cast<std::uintptr_t>(event_listener));
 	worker_ = std::jthread([this](std::stop_token stop_token) { run(stop_token); });
+	event_worker_ = std::jthread([this](std::stop_token stop_token) { run_widget_events(stop_token); });
 	return true;
 }
 
@@ -527,9 +881,14 @@ void ProviderServer::stop()
 		return;
 	worker_.request_stop();
 	worker_.join();
+	event_worker_.request_stop();
+	event_worker_.join();
 	const SOCKET listener = static_cast<SOCKET>(listener_.exchange(INVALID_SOCKET));
 	if (listener != INVALID_SOCKET)
 		closesocket(listener);
+	const SOCKET event_listener = static_cast<SOCKET>(event_listener_.exchange(INVALID_SOCKET));
+	if (event_listener != INVALID_SOCKET)
+		closesocket(event_listener);
 	WSACleanup();
 }
 
@@ -571,12 +930,14 @@ void ProviderServer::run(std::stop_token stop_token)
 				    (host->second != "127.0.0.1" + expected_host && host->second != "localhost" + expected_host)) {
 					send_response(client, {403, "application/json; charset=utf-8", json_error("This service only accepts local requests.")});
 				} else if (!origin.empty() && origin != "null" &&
-					   origin != "http://127.0.0.1" + expected_host && origin != "http://localhost" + expected_host) {
+					   origin != "http://127.0.0.1" + expected_host && origin != "http://localhost" + expected_host &&
+					   !(allows_widget_origin(request->path) && valid_widget_origin(origin))) {
 					send_response(client, {403, "application/json; charset=utf-8", json_error("This origin is not allowed.")});
 				} else if (request->method == "OPTIONS") {
 					send_response(client, {204, "text/plain; charset=utf-8", {},
 							       "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-							       "Access-Control-Allow-Headers: Authorization, Content-Type, X-Admin-Token\r\n"},
+							       "Access-Control-Allow-Headers: Authorization, Content-Type, X-Admin-Token\r\n"
+							       "Access-Control-Allow-Private-Network: true\r\n"},
 						      origin);
 				} else {
 					handle_request(client, *request, origin);
@@ -593,6 +954,184 @@ void ProviderServer::run(std::stop_token stop_token)
 		shutdown(client, SD_BOTH);
 		closesocket(client);
 	}
+}
+
+void ProviderServer::run_widget_events(std::stop_token stop_token)
+{
+	std::vector<WidgetEventClient> clients;
+	while (!stop_token.stop_requested()) {
+		const SOCKET listener = static_cast<SOCKET>(event_listener_.load());
+		if (listener == INVALID_SOCKET)
+			break;
+
+		fd_set read_set;
+		FD_ZERO(&read_set);
+		FD_SET(listener, &read_set);
+		for (const auto &client : clients) {
+			if (client.socket != INVALID_SOCKET)
+				FD_SET(client.socket, &read_set);
+		}
+		timeval wait_time{0, 250000};
+		const int ready = select(0, &read_set, nullptr, nullptr, &wait_time);
+		if (ready == SOCKET_ERROR) {
+			if (stop_token.stop_requested())
+				break;
+			continue;
+		}
+
+		if (ready > 0 && FD_ISSET(listener, &read_set)) {
+			const SOCKET socket = accept(listener, nullptr, nullptr);
+			if (socket != INVALID_SOCKET) {
+				if (clients.size() >= kMaxWidgetEventClients) {
+					send_response(socket, {503, "application/json; charset=utf-8",
+							       json_error("The widget WebSocket connection limit was reached.")});
+					shutdown(socket, SD_BOTH);
+					closesocket(socket);
+					continue;
+				}
+				DWORD timeout = kSocketTimeoutMs;
+				setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&timeout),
+					   sizeof(timeout));
+				setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeout),
+					   sizeof(timeout));
+				try {
+					const auto request = read_request(socket);
+					if (request) {
+						const auto host = request->headers.find("host");
+						const auto origin_header = request->headers.find("origin");
+						const auto key_header = request->headers.find("sec-websocket-key");
+						const auto upgrade_header = request->headers.find("upgrade");
+						const auto version_header = request->headers.find("sec-websocket-version");
+						const auto protocol_header = request->headers.find("sec-websocket-protocol");
+						const std::string_view origin =
+							origin_header == request->headers.end() ? std::string_view{} : origin_header->second;
+						const bool valid_host =
+							host != request->headers.end() &&
+							(host->second == "127.0.0.1:" + std::to_string(widget_events_port_) ||
+							 host->second == "localhost:" + std::to_string(widget_events_port_));
+						const bool valid_origin = valid_widget_origin(origin);
+						const bool valid_upgrade = upgrade_header != request->headers.end() &&
+							lower_ascii(trim(upgrade_header->second)) == "websocket" &&
+							version_header != request->headers.end() && version_header->second == "13" &&
+							key_header != request->headers.end() && !key_header->second.empty();
+						std::string widget_token;
+						if (protocol_header != request->headers.end()) {
+							std::istringstream protocols(protocol_header->second);
+							std::string protocol;
+							std::getline(protocols, protocol, ',');
+							std::string token;
+							std::getline(protocols, token, ',');
+							if (trim(protocol) == "donationalerts-widget-v1")
+								widget_token = trim(token);
+						}
+						const bool has_token = !widget_token.empty();
+						HttpRequest auth_request;
+						if (has_token)
+							auth_request.headers.emplace("authorization", "Bearer " + widget_token);
+						const bool valid_request = request->method == "GET" &&
+							request->path == "/api/widget/events" && valid_host && valid_origin &&
+							valid_upgrade && has_token &&
+							authorize_widget(auth_request, "read:donation-events") ==
+								WidgetAuthorization::authorized;
+						if (valid_request) {
+							const auto accept_key = websocket_accept(key_header->second);
+							const std::string handshake =
+								"HTTP/1.1 101 Switching Protocols\r\n"
+								"Upgrade: websocket\r\n"
+								"Connection: Upgrade\r\n"
+								"Sec-WebSocket-Protocol: donationalerts-widget-v1\r\n"
+								"Sec-WebSocket-Accept: " + accept_key + "\r\n\r\n";
+							const char *data = handshake.data();
+							std::size_t remaining = handshake.size();
+							while (remaining > 0) {
+								const int sent = send(socket, data,
+									static_cast<int>(std::min<std::size_t>(remaining, INT_MAX)), 0);
+								if (sent <= 0)
+									break;
+								data += sent;
+								remaining -= static_cast<std::size_t>(sent);
+							}
+							std::string realtime_status;
+							{
+								std::lock_guard lock(state_->mutex);
+								realtime_status = state_->realtime_status_json;
+							}
+							if (remaining == 0 && websocket_send(socket, 0x1, realtime_status)) {
+								u_long non_blocking = 1;
+								if (ioctlsocket(socket, FIONBIO, &non_blocking) == 0) {
+									clients.push_back({socket, sha256_hex(widget_token), {}});
+									continue;
+								}
+							}
+						} else {
+							const int status = valid_host && valid_origin ? 401 : 403;
+							send_response(socket, {status, "application/json; charset=utf-8",
+								json_error(status == 401 ? "A valid donation widget token is required."
+											 : "This WebSocket request is not allowed.")});
+						}
+					}
+				} catch (const std::exception &error) {
+					const std::string debug_message =
+						std::string("[DonationAlerts Provider] WebSocket handshake error: ") + error.what() + "\n";
+					OutputDebugStringA(debug_message.c_str());
+				}
+				shutdown(socket, SD_BOTH);
+				closesocket(socket);
+			}
+		}
+
+		for (std::size_t index = 0; index < clients.size();) {
+			auto &client = clients[index];
+			bool keep = client.socket != INVALID_SOCKET;
+			if (keep && ready > 0 && FD_ISSET(client.socket, &read_set)) {
+				std::array<std::uint8_t, 4096> incoming{};
+				const int received = recv(client.socket, reinterpret_cast<char *>(incoming.data()),
+							  static_cast<int>(incoming.size()), 0);
+				if (received <= 0) {
+					keep = false;
+				} else {
+					client.input.insert(client.input.end(), incoming.begin(),
+							    incoming.begin() + received);
+					keep = process_websocket_frames(client);
+				}
+			}
+			if (!keep) {
+				close_event_client(client);
+				clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(index));
+			} else {
+				++index;
+			}
+		}
+
+		std::deque<std::string> events;
+		{
+			std::lock_guard lock(state_->mutex);
+			events.swap(state_->donation_events);
+		}
+		for (const auto &event : events) {
+			for (std::size_t index = 0; index < clients.size();) {
+				auto &client = clients[index];
+				bool authorized = false;
+				{
+					std::lock_guard lock(state_->mutex);
+					const auto token = state_->tokens.find(client.token_hash);
+					authorized = token != state_->tokens.end() &&
+						(token->second.expires_at_ms == 0 || token->second.expires_at_ms > clock_()) &&
+						std::find(token->second.scopes.begin(), token->second.scopes.end(),
+							  "read:donation-events") != token->second.scopes.end();
+				}
+				if (!authorized || !websocket_send(client.socket, 0x1, event)) {
+					close_event_client(client);
+					clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(index));
+				} else {
+					++index;
+				}
+			}
+		}
+	}
+
+	for (auto &client : clients)
+		close_event_client(client);
 }
 
 void ProviderServer::handle_request(std::uintptr_t client_socket, const HttpRequest &request, std::string_view origin)
@@ -671,7 +1210,43 @@ void ProviderServer::handle_request(std::uintptr_t client_socket, const HttpRequ
 		}
 	}
 
-	if (request.path == "/api/provider/profile" || request.path == "/api/provider/donations") {
+	if (request.path == "/api/provider/oauth-token") {
+		const auto admin_header = request.headers.find("x-admin-token");
+		if (admin_header == request.headers.end() || !constant_time_equal(admin_header->second, admin_token_)) {
+			send_response(client, {401, "application/json; charset=utf-8", json_error("A valid admin token is required.")},
+				      origin);
+			return;
+		}
+		if (request.method != "POST") {
+			send_response(client, {405, "application/json; charset=utf-8", json_error("Use POST to update the OAuth token.")},
+				      origin);
+			return;
+		}
+		const auto fields = parse_form(request.body);
+		if (!fields) {
+			send_response(client, {400, "application/json; charset=utf-8", json_error("A valid access_token field is required.")},
+				      origin);
+			return;
+		}
+		const auto access_token = fields->find("access_token");
+		if (access_token == fields->end() || access_token->second.size() > 4096 ||
+		    std::any_of(access_token->second.begin(), access_token->second.end(), [](unsigned char ch) {
+			    return ch < 0x20 || ch == 0x7f;
+		    })) {
+			send_response(client, {400, "application/json; charset=utf-8", json_error("A valid access_token field is required.")},
+				      origin);
+			return;
+		}
+		{
+			std::lock_guard lock(state_->mutex);
+			state_->upstream_access_token = access_token->second;
+		}
+		send_response(client, {204, "application/json; charset=utf-8", {}}, origin);
+		return;
+	}
+
+	if (request.path == "/api/provider/profile" || request.path == "/api/provider/donations" ||
+	    request.path == "/api/provider/donation-event" || request.path == "/api/provider/realtime-status") {
 		const auto admin_header = request.headers.find("x-admin-token");
 		if (admin_header == request.headers.end() || !constant_time_equal(admin_header->second, admin_token_)) {
 			send_response(client, {401, "application/json; charset=utf-8", json_error("A valid admin token is required.")},
@@ -680,11 +1255,16 @@ void ProviderServer::handle_request(std::uintptr_t client_socket, const HttpRequ
 		}
 		if (request.method == "POST") {
 			const bool profile = request.path == "/api/provider/profile";
+			const bool event = request.path == "/api/provider/donation-event";
+			const bool realtime_status = request.path == "/api/provider/realtime-status";
 			const bool valid_shape = profile ? (request.body == "null" ||
 								 (request.body.size() >= 2 && request.body.front() == '{' &&
 								  request.body.back() == '}'))
-							 : (request.body.size() >= 2 && request.body.front() == '[' &&
-							    request.body.back() == ']');
+							 : (event || realtime_status)
+								   ? (request.body.size() >= 2 && request.body.front() == '{' &&
+								      request.body.back() == '}')
+								   : (request.body.size() >= 2 && request.body.front() == '[' &&
+								      request.body.back() == ']');
 			if (!valid_shape) {
 				send_response(client, {400, "application/json; charset=utf-8", json_error("Invalid provider data.")},
 					      origin);
@@ -694,6 +1274,12 @@ void ProviderServer::handle_request(std::uintptr_t client_socket, const HttpRequ
 				std::lock_guard lock(state_->mutex);
 				if (profile)
 					state_->profile_json = request.body;
+				else if (event)
+					state_->donation_events.push_back(request.body);
+				else if (realtime_status) {
+					state_->realtime_status_json = request.body;
+					state_->donation_events.push_back(request.body);
+				}
 				else
 					state_->donations_json = request.body;
 			}
@@ -703,15 +1289,20 @@ void ProviderServer::handle_request(std::uintptr_t client_socket, const HttpRequ
 	}
 
 	if (request.method == "GET" && request.path == "/api/widget/data") {
-		const auto authorization = request.headers.find("authorization");
-		if (authorization == request.headers.end() || !authorization->second.starts_with("Bearer ")) {
+		const auto authorization_header = request.headers.find("authorization");
+		if (authorization_header == request.headers.end() ||
+		    !authorization_header->second.starts_with("Bearer ")) {
 			send_response(client, {401, "application/json; charset=utf-8", json_error("A widget bearer token is required.")},
 				      origin);
 			return;
 		}
-		if (!authorize_widget(request, "read:donation-events")) {
-			send_response(client, {403, "application/json; charset=utf-8",
-					       json_error("This widget token does not have the donation-events scope.")},
+		const auto authorization = authorize_widget(request, "read:donation-events");
+		if (authorization != WidgetAuthorization::authorized) {
+			const bool invalid_token = authorization == WidgetAuthorization::invalid_token;
+			send_response(client, {invalid_token ? 401 : 403, "application/json; charset=utf-8",
+					       json_error(invalid_token
+								  ? "A valid, unexpired widget token is required."
+								  : "This widget token does not have the donation-events scope.")},
 				      origin);
 			return;
 		}
@@ -723,6 +1314,52 @@ void ProviderServer::handle_request(std::uintptr_t client_socket, const HttpRequ
 				",\"goals\":[],\"polls\":[]}";
 			send_response(client, {200, "application/json; charset=utf-8", response}, origin);
 		}
+		return;
+	}
+
+	if (request.method == "GET" &&
+	    (request.path == "/api/v1/user/oauth" || request.path == "/api/v1/alerts/donations")) {
+		const auto authorization = authorize_widget(request, "read:donation-events");
+		if (authorization != WidgetAuthorization::authorized) {
+			const bool invalid_token = authorization == WidgetAuthorization::invalid_token;
+			send_response(client, {invalid_token ? 401 : 403, "application/json; charset=utf-8",
+					       json_error(invalid_token
+								  ? "A valid, unexpired widget token is required."
+								  : "This widget token does not have the donation-events scope.")},
+				      origin);
+			return;
+		}
+		if (request.path == "/api/v1/user/oauth") {
+			std::string profile;
+			{
+				std::lock_guard lock(state_->mutex);
+				profile = state_->profile_json;
+			}
+			if (profile == "null") {
+				send_response(client, {503, "application/json; charset=utf-8",
+						       json_error("DonationAlerts account is not connected in OBS.")},
+					      origin);
+				return;
+			}
+			send_response(client, {200, "application/json; charset=utf-8",
+					       "{\"data\":" + profile + "}"},
+				      origin);
+			return;
+		}
+
+		std::string access_token;
+		{
+			std::lock_guard lock(state_->mutex);
+			access_token = state_->upstream_access_token;
+		}
+		if (access_token.empty()) {
+			send_response(client, {503, "application/json; charset=utf-8",
+					       json_error("DonationAlerts account is not connected in OBS.")},
+				      origin);
+			return;
+		}
+		const auto proxied = proxy_donationalerts_get(request.target, access_token);
+		send_response(client, proxied, origin);
 		return;
 	}
 
@@ -764,45 +1401,230 @@ void ProviderServer::handle_request(std::uintptr_t client_socket, const HttpRequ
 	send_response(client, {404, "application/json; charset=utf-8", json_error("Not found.")}, origin);
 }
 
-bool ProviderServer::authorize_widget(const HttpRequest &request, std::string_view required_scope)
+ProviderServer::WidgetAuthorization ProviderServer::authorize_widget(const HttpRequest &request,
+								     std::string_view required_scope)
 {
 	const auto authorization = request.headers.find("authorization");
 	if (authorization == request.headers.end() || !authorization->second.starts_with("Bearer "))
-		return false;
+		return WidgetAuthorization::invalid_token;
 	const auto token = std::string_view(authorization->second).substr(7);
 	if (token.empty())
-		return false;
+		return WidgetAuthorization::invalid_token;
 
 	std::lock_guard lock(state_->mutex);
 	const auto found = state_->tokens.find(sha256_hex(token));
-	if (found == state_->tokens.end() || found->second.expires_at_ms <= current_time_ms())
-		return false;
+	if (found == state_->tokens.end() ||
+	    (found->second.expires_at_ms != 0 && found->second.expires_at_ms <= clock_()))
+		return WidgetAuthorization::invalid_token;
 	return std::find(found->second.scopes.begin(), found->second.scopes.end(), required_scope) !=
-	       found->second.scopes.end();
+			       found->second.scopes.end()
+		       ? WidgetAuthorization::authorized
+		       : WidgetAuthorization::insufficient_scope;
 }
 
 std::string ProviderServer::list_widget_tokens()
 {
 	std::lock_guard lock(state_->mutex);
-	const auto now = current_time_ms();
+	const auto now = clock_();
 	std::string output = "[";
 	bool first = true;
-	for (auto iterator = state_->tokens.begin(); iterator != state_->tokens.end();) {
-		if (iterator->second.expires_at_ms <= now) {
-			iterator = state_->tokens.erase(iterator);
-			continue;
-		}
-		const auto &token = iterator->second;
+	for (const auto &entry : state_->tokens) {
+		const auto &token = entry.second;
 		if (!first)
 			output += ',';
 		first = false;
 		output += "{\"id\":\"" + json_escape(token.id) + "\",\"name\":\"" + json_escape(token.name) +
 			  "\",\"scopes\":" + scopes_json(token.scopes) + ",\"expiresAt\":" +
-			  std::to_string(token.expires_at_ms) + "}";
-		++iterator;
+			  (token.expires_at_ms == 0 ? "null" : std::to_string(token.expires_at_ms)) +
+			  ",\"active\":" +
+			  (token.expires_at_ms == 0 || token.expires_at_ms > now ? "true" : "false") + "}";
 	}
 	output += ']';
 	return output;
+}
+
+bool ProviderServer::load_widget_tokens(std::string &error)
+{
+	if (token_store_path_.empty()) {
+		error = "The widget token storage path is unavailable (APPDATA is not set).";
+		return false;
+	}
+
+	HANDLE file = CreateFileW(token_store_path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+				  FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		const DWORD code = GetLastError();
+		if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
+			return true;
+		error = "Unable to open the widget token store (Windows " + std::to_string(code) + ").";
+		return false;
+	}
+
+	LARGE_INTEGER size{};
+	if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 1024 * 1024) {
+		const DWORD code = GetLastError();
+		CloseHandle(file);
+		error = "The widget token store has an invalid size (Windows " + std::to_string(code) + ").";
+		return false;
+	}
+
+	std::string encrypted(static_cast<std::size_t>(size.QuadPart), '\0');
+	DWORD bytes_read = 0;
+	const BOOL read_ok = ReadFile(file, encrypted.data(), static_cast<DWORD>(encrypted.size()), &bytes_read, nullptr);
+	CloseHandle(file);
+	if (!read_ok || bytes_read != encrypted.size()) {
+		error = "Unable to read the widget token store (Windows " + std::to_string(GetLastError()) + ").";
+		return false;
+	}
+
+	DATA_BLOB input{static_cast<DWORD>(encrypted.size()), reinterpret_cast<BYTE *>(encrypted.data())};
+	DATA_BLOB output{};
+	if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output)) {
+		error = "Unable to decrypt the widget token store (Windows " + std::to_string(GetLastError()) + ").";
+		return false;
+	}
+	std::string plaintext(reinterpret_cast<const char *>(output.pbData), output.cbData);
+	LocalFree(output.pbData);
+
+	static constexpr std::string_view magic = "DAWTOK1";
+	if (plaintext.size() < magic.size() + 4 || plaintext.substr(0, magic.size()) != magic) {
+		error = "The widget token store has an unsupported or corrupted format.";
+		return false;
+	}
+	std::size_t position = magic.size();
+	std::uint32_t count = 0;
+	if (!read_u32(plaintext, position, count) || count > 500) {
+		error = "The widget token store contains an invalid token count.";
+		return false;
+	}
+
+	std::map<std::string, WidgetToken, std::less<>> loaded_tokens;
+	for (std::uint32_t index = 0; index < count; ++index) {
+		std::string hash;
+		std::string id;
+		std::uint64_t expires_at = 0;
+		std::string name;
+		std::uint32_t scope_count = 0;
+		if (!read_string(plaintext, position, hash, 64) || hash.size() != 64 || !is_hex_string(hash) ||
+		    !read_string(plaintext, position, id, 32) || id.size() != 32 || !is_hex_string(id) ||
+		    !read_u64(plaintext, position, expires_at) ||
+		    expires_at > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+		    !read_string(plaintext, position, name, 320) ||
+		    !valid_utf8(name) || !read_u32(plaintext, position, scope_count) || scope_count == 0 || scope_count > 3) {
+			error = "The widget token store contains invalid token metadata.";
+			return false;
+		}
+
+		std::vector<std::string> scopes;
+		std::string scope_list;
+		for (std::uint32_t scope_index = 0; scope_index < scope_count; ++scope_index) {
+			std::string scope;
+			if (!read_string(plaintext, position, scope, 64)) {
+				error = "The widget token store contains invalid scopes.";
+				return false;
+			}
+			if (!scope_list.empty())
+				scope_list += ',';
+			scope_list += scope;
+			scopes.push_back(std::move(scope));
+		}
+		const auto validated_scopes = parse_scopes(scope_list);
+		if (!validated_scopes || *validated_scopes != scopes) {
+			error = "The widget token store contains unsupported scopes.";
+			return false;
+		}
+		const auto inserted =
+			loaded_tokens.emplace(std::move(hash),
+					      WidgetToken{std::move(id), std::move(name), std::move(scopes),
+							  static_cast<std::int64_t>(expires_at)}).second;
+		if (!inserted) {
+			error = "The widget token store contains duplicate entries.";
+			return false;
+		}
+	}
+	if (position != plaintext.size()) {
+		error = "The widget token store contains unexpected trailing data.";
+		return false;
+	}
+	state_->tokens = std::move(loaded_tokens);
+	return true;
+}
+
+bool ProviderServer::persist_widget_tokens(std::string &error) const
+{
+	if (token_store_path_.empty()) {
+		error = "The widget token storage path is unavailable (APPDATA is not set).";
+		return false;
+	}
+
+	std::string plaintext = "DAWTOK1";
+	if (state_->tokens.size() > 500) {
+		error = "The widget token store exceeds its maximum supported token count.";
+		return false;
+	}
+	append_u32(plaintext, static_cast<std::uint32_t>(state_->tokens.size()));
+	for (const auto &[hash, token] : state_->tokens) {
+		if (!append_string(plaintext, hash) || !append_string(plaintext, token.id)) {
+			error = "The widget token metadata is too large to store.";
+			return false;
+		}
+		append_u64(plaintext, static_cast<std::uint64_t>(token.expires_at_ms));
+		if (!append_string(plaintext, token.name)) {
+			error = "The widget token metadata is too large to store.";
+			return false;
+		}
+		append_u32(plaintext, static_cast<std::uint32_t>(token.scopes.size()));
+		for (const auto &scope : token.scopes) {
+			if (!append_string(plaintext, scope)) {
+				error = "The widget token scope is too large to store.";
+				return false;
+			}
+		}
+	}
+	if (plaintext.size() > 1024 * 1024) {
+		error = "The widget token store exceeds its maximum supported size.";
+		return false;
+	}
+
+	DATA_BLOB input{static_cast<DWORD>(plaintext.size()), reinterpret_cast<BYTE *>(plaintext.data())};
+	DATA_BLOB output{};
+	if (!CryptProtectData(&input, L"DonationAlerts OBS Provider widget tokens", nullptr, nullptr, nullptr,
+			      CRYPTPROTECT_UI_FORBIDDEN, &output)) {
+		error = "Unable to encrypt the widget token store (Windows " + std::to_string(GetLastError()) + ").";
+		return false;
+	}
+	const std::string encrypted(reinterpret_cast<const char *>(output.pbData), output.cbData);
+	LocalFree(output.pbData);
+
+	const std::filesystem::path destination(token_store_path_);
+	std::error_code filesystem_error;
+	std::filesystem::create_directories(destination.parent_path(), filesystem_error);
+	if (filesystem_error) {
+		error = "Unable to create the widget token storage directory (Windows " +
+			std::to_string(static_cast<unsigned long>(filesystem_error.value())) + ").";
+		return false;
+	}
+	const std::wstring temporary_path = token_store_path_ + L".tmp";
+	HANDLE file = CreateFileW(temporary_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+				  FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		error = "Unable to create the widget token store (Windows " + std::to_string(GetLastError()) + ").";
+		return false;
+	}
+
+	DWORD bytes_written = 0;
+	const BOOL write_ok = WriteFile(file, encrypted.data(), static_cast<DWORD>(encrypted.size()), &bytes_written, nullptr);
+	const BOOL flush_ok = write_ok && bytes_written == encrypted.size() && FlushFileBuffers(file);
+	const DWORD write_error = flush_ok ? ERROR_SUCCESS : GetLastError();
+	CloseHandle(file);
+	if (!flush_ok || !MoveFileExW(temporary_path.c_str(), token_store_path_.c_str(),
+				      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+		const DWORD code = flush_ok ? GetLastError() : write_error;
+		DeleteFileW(temporary_path.c_str());
+		error = "Unable to save the widget token store (Windows " + std::to_string(code) + ").";
+		return false;
+	}
+	return true;
 }
 
 HttpResponse ProviderServer::issue_widget_token(std::string_view body)
@@ -812,19 +1634,40 @@ HttpResponse ProviderServer::issue_widget_token(std::string_view body)
 		return {400, "application/json; charset=utf-8", json_error("Request form is invalid.")};
 	const auto name_field = fields->find("name");
 	const auto lifetime_field = fields->find("expiresInMinutes");
+	const auto expiration_field = fields->find("expiresAt");
 	const auto scopes_field = fields->find("scopes");
-	if (name_field == fields->end() || lifetime_field == fields->end() || scopes_field == fields->end())
-		return {400, "application/json; charset=utf-8", json_error("name, expiresInMinutes, and scopes are required.")};
+	if (name_field == fields->end() ||
+	    (lifetime_field == fields->end() && expiration_field == fields->end()) ||
+	    scopes_field == fields->end())
+		return {400, "application/json; charset=utf-8",
+			json_error("name, expiresAt (or legacy expiresInMinutes), and scopes are required.")};
 	if (!valid_utf8(name_field->second))
 		return {400, "application/json; charset=utf-8", json_error("name must contain valid UTF-8 text.")};
 
-	int lifetime_minutes = 0;
-	const auto lifetime = std::from_chars(lifetime_field->second.data(),
-					      lifetime_field->second.data() + lifetime_field->second.size(),
-					      lifetime_minutes);
-	if (lifetime.ec != std::errc{} || lifetime.ptr != lifetime_field->second.data() + lifetime_field->second.size() ||
-	    lifetime_minutes < 1 || lifetime_minutes > 1440)
-		return {400, "application/json; charset=utf-8", json_error("expiresInMinutes must be between 1 and 1440.")};
+	std::int64_t expires_at = 0;
+	if (expiration_field != fields->end()) {
+		const auto expiration =
+			std::from_chars(expiration_field->second.data(),
+					expiration_field->second.data() + expiration_field->second.size(), expires_at);
+		if (expiration.ec != std::errc{} ||
+		    expiration.ptr != expiration_field->second.data() + expiration_field->second.size() ||
+		    expires_at < 0 || (expires_at != 0 && expires_at <= clock_()))
+			return {400, "application/json; charset=utf-8",
+				json_error("expiresAt must be 0 (no expiration) or a future Unix timestamp in milliseconds.")};
+	} else {
+		int lifetime_minutes = 0;
+		const auto lifetime = std::from_chars(lifetime_field->second.data(),
+						      lifetime_field->second.data() + lifetime_field->second.size(),
+						      lifetime_minutes);
+		if (lifetime.ec != std::errc{} ||
+		    lifetime.ptr != lifetime_field->second.data() + lifetime_field->second.size() ||
+		    lifetime_minutes < 0 || lifetime_minutes > 1440)
+			return {400, "application/json; charset=utf-8",
+				json_error("Legacy expiresInMinutes must be 0 (no expiration) or between 1 and 1440.")};
+		expires_at = lifetime_minutes == 0
+				     ? 0
+				     : clock_() + static_cast<std::int64_t>(lifetime_minutes) * 60 * 1000;
+	}
 
 	const auto scopes = parse_scopes(scopes_field->second);
 	if (!scopes)
@@ -832,27 +1675,24 @@ HttpResponse ProviderServer::issue_widget_token(std::string_view body)
 
 	const std::string token = random_hex(32);
 	const std::string id = random_hex(16);
-	const std::int64_t expires_at = current_time_ms() + static_cast<std::int64_t>(lifetime_minutes) * 60 * 1000;
 	const std::string name = limit_utf8_characters(name_field->second, 80);
 	{
 		std::lock_guard lock(state_->mutex);
-		const auto now = current_time_ms();
-		for (auto iterator = state_->tokens.begin(); iterator != state_->tokens.end();) {
-			if (iterator->second.expires_at_ms <= now)
-				iterator = state_->tokens.erase(iterator);
-			else
-				++iterator;
-		}
 		if (state_->tokens.size() >= 500)
 			return {429, "application/json; charset=utf-8",
-				json_error("The provider has reached its limit of 500 active widget tokens.")};
-		state_->tokens.emplace(sha256_hex(token),
-				       WidgetToken{id, name.empty() ? "widget" : name, *scopes, expires_at});
+				json_error("The provider has reached its limit of 500 stored widget token records. Revoke unused tokens to issue another.")};
+		const std::string token_hash = sha256_hex(token);
+		state_->tokens.emplace(token_hash, WidgetToken{id, name.empty() ? "widget" : name, *scopes, expires_at});
+		std::string storage_error;
+		if (!persist_widget_tokens(storage_error)) {
+			state_->tokens.erase(token_hash);
+			return {500, "application/json; charset=utf-8", json_error(storage_error)};
+		}
 	}
 
 	const std::string body_json = "{\"id\":\"" + id + "\",\"name\":\"" + json_escape(name.empty() ? "widget" : name) +
 		"\",\"token\":\"" + token + "\",\"scopes\":" + scopes_json(*scopes) +
-		",\"expiresAt\":" + std::to_string(expires_at) + "}";
+		",\"expiresAt\":" + (expires_at == 0 ? "null" : std::to_string(expires_at)) + "}";
 	return {201, "application/json; charset=utf-8", body_json};
 }
 
@@ -870,7 +1710,14 @@ HttpResponse ProviderServer::revoke_widget_token(std::string_view body)
 		std::lock_guard lock(state_->mutex);
 		for (auto iterator = state_->tokens.begin(); iterator != state_->tokens.end(); ++iterator) {
 			if (iterator->second.id == id->second) {
+				const auto token_hash = iterator->first;
+				const auto token = iterator->second;
 				state_->tokens.erase(iterator);
+				std::string storage_error;
+				if (!persist_widget_tokens(storage_error)) {
+					state_->tokens.emplace(token_hash, token);
+					return {500, "application/json; charset=utf-8", json_error(storage_error)};
+				}
 				revoked = true;
 				break;
 			}

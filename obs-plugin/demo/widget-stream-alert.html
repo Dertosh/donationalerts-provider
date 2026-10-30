@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Тестовый виджет — алерт доната</title>
+  <link rel="stylesheet" href="widget-stream.css">
+</head>
+<body data-widget="alert">
+  <main class="widget">
+    <article id="alert" class="alert" aria-live="polite">
+      <div class="alert-icon" aria-hidden="true">♥</div>
+      <div class="alert-content">
+        <p class="eyebrow">Новый донат</p>
+        <div class="alert-heading">
+          <strong id="donor" class="donor"></strong>
+          <span id="amount" class="amount"></span>
+        </div>
+        <p id="message" class="message"></p>
+      </div>
+    </article>
+  </main>
+  <button id="preview" class="settings-toggle preview-toggle" type="button">Тест алерта</button>
+  <button id="settings-toggle" class="settings-toggle" type="button" aria-expanded="false"
+          aria-controls="settings-panel" aria-label="Показать настройки ключа">Настройки</button>
+  <section id="settings-panel" class="setup" aria-label="Настройка тестового виджета">
+    <input id="widget-token" type="password" autocomplete="off" spellcheck="false"
+           placeholder="Ключ провайдера из панели OBS">
+    <button id="connect" type="button">Подключить</button>
+    <p id="status" class="status" role="status" aria-live="polite">Источник данных: API плагина OBS. Вставьте временный ключ провайдера.</p>
+  </section>
+  <script src="widget-stream.js"></script>
+</body>
+</html>

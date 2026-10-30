@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Тестовый виджет — лента донатов</title>
+  <link rel="stylesheet" href="widget-stream.css">
+</head>
+<body data-widget="feed" data-source="donationalerts-api">
+  <main class="widget">
+    <section class="feed" aria-label="Последние донаты">
+      <header class="feed-title">Последние донаты · API DonationAlerts</header>
+      <div id="feed-list" class="feed-list"></div>
+    </section>
+  </main>
+  <button id="preview" class="settings-toggle preview-toggle" type="button">Пример записи</button>
+  <button id="settings-toggle" class="settings-toggle" type="button" aria-expanded="false"
+          aria-controls="settings-panel" aria-label="Показать настройки ключа">Настройки</button>
+  <section id="settings-panel" class="setup" aria-label="Настройка тестового виджета">
+    <input id="widget-token" type="password" autocomplete="off" spellcheck="false"
+           placeholder="Ключ провайдера из панели OBS">
+    <button id="connect" type="button">Подключить</button>
+    <p id="status" class="status" role="status" aria-live="polite">Источник истории: API DonationAlerts через прокси OBS. Вставьте временный ключ провайдера.</p>
+  </section>
+  <script src="widget-stream.js"></script>
+</body>
+</html>

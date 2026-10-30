@@ -17,13 +17,15 @@ foreach(required_file IN ITEMS
     "${OBS_BUILD_DIR}/frontend/api/Release/obs-frontend-api.lib"
     "${OBS_QT_DIR}/include/QtWidgets/QWidget"
     "${OBS_QT_DIR}/lib/Qt6Widgets.lib"
-    "${OBS_QT_DIR}/lib/Qt6Network.lib")
+    "${OBS_QT_DIR}/lib/Qt6Network.lib"
+    "${OBS_QT_DIR}/plugins/tls/qschannelbackend.dll")
   if(NOT EXISTS "${required_file}")
     message(FATAL_ERROR "OBS SDK is missing '${required_file}'. Run tools/prepare-obs-sdk.ps1 first.")
   endif()
 endforeach()
 
 add_library(donationalerts_obs_provider MODULE
+  src/donation_stream.cpp
   src/plugin.cpp
   src/provider_panel.cpp
   src/provider_server.cpp
@@ -60,11 +62,19 @@ target_link_libraries(donationalerts_obs_provider PRIVATE
   Qt6Core
   bcrypt
   crypt32
+  winhttp
   ws2_32
 )
 set_target_properties(donationalerts_obs_provider PROPERTIES
   PREFIX ""
   OUTPUT_NAME "donationalerts-obs-provider"
+)
+add_custom_command(TARGET donationalerts_obs_provider POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:donationalerts_obs_provider>/qt-plugins/tls"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${OBS_QT_DIR}/plugins/tls/qschannelbackend.dll"
+    "$<TARGET_FILE_DIR:donationalerts_obs_provider>/qt-plugins/tls/qschannelbackend.dll"
+  VERBATIM
 )
 
 include(CTest)
@@ -79,7 +89,7 @@ if(BUILD_TESTING)
     target_compile_options(provider-server-tests PRIVATE /utf-8)
   endif()
   target_include_directories(provider-server-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-  target_link_libraries(provider-server-tests PRIVATE bcrypt ws2_32)
+  target_link_libraries(provider-server-tests PRIVATE bcrypt crypt32 winhttp ws2_32)
   add_test(NAME provider-server COMMAND provider-server-tests)
 endif()
 
@@ -90,4 +100,10 @@ install(TARGETS donationalerts_obs_provider
 )
 install(DIRECTORY data/locale
   DESTINATION "plugins/donationalerts-obs-provider/data"
+)
+install(DIRECTORY demo/
+  DESTINATION "plugins/donationalerts-obs-provider/data/demo"
+)
+install(FILES "${OBS_QT_DIR}/plugins/tls/qschannelbackend.dll"
+  DESTINATION "plugins/donationalerts-obs-provider/bin/64bit/qt-plugins/tls"
 )

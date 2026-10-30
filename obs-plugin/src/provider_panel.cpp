@@ -1,4 +1,5 @@
 #include "provider_panel.hpp"
+#include "donation_stream.hpp"
 
 #include <obs-module.h>
 
@@ -8,7 +9,11 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
+#include <QCoreApplication>
 #include <QDateTime>
+#include <QDateEdit>
+#include <QMetaObject>
+#include <QPointer>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDir>
@@ -28,10 +33,10 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QSaveFile>
-#include <QSpinBox>
 #include <QStringList>
 #include <QTimer>
 #include <QUrl>
@@ -39,6 +44,7 @@
 #include <QVBoxLayout>
 
 #include <cstdint>
+#include <iterator>
 #include <utility>
 
 namespace {
@@ -112,14 +118,35 @@ QString api_url(const QString &path)
 	return QStringLiteral("https://www.donationalerts.com") + path;
 }
 
+void add_plugin_qt_library_path()
+{
+	HMODULE module = nullptr;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(&add_plugin_qt_library_path), &module))
+		return;
+
+	wchar_t module_path[MAX_PATH]{};
+	const DWORD length = GetModuleFileNameW(module, module_path, static_cast<DWORD>(std::size(module_path)));
+	if (length == 0 || length >= std::size(module_path))
+		return;
+
+	const auto plugin_directory = QFileInfo(QString::fromWCharArray(module_path, static_cast<qsizetype>(length)))
+					     .absolutePath();
+	const auto qt_plugin_path = QDir(plugin_directory).filePath(QStringLiteral("qt-plugins"));
+	if (QDir(qt_plugin_path).exists())
+		QCoreApplication::addLibraryPath(qt_plugin_path);
+}
+
 } // namespace
 
 ProviderPanel::ProviderPanel(std::string admin_token)
 	: admin_token_(std::move(admin_token)),
 	  network_(new QNetworkAccessManager(this)),
 	  status_(new QLabel(this)),
+	  copy_status_button_(new QPushButton(localized("Panel.CopyStatus"), this)),
 	  name_(new QLineEdit(QStringLiteral("obs-widget"), this)),
-	  lifetime_(new QSpinBox(this)),
+	  no_expiration_(new QCheckBox(localized("Panel.NoExpiration"), this)),
+	  expiration_date_(new QDateEdit(this)),
 	  donation_scope_(new QCheckBox(localized("Panel.Scope.Donations"), this)),
 	  goal_scope_(new QCheckBox(localized("Panel.Scope.Goals"), this)),
 	  poll_scope_(new QCheckBox(localized("Panel.Scope.Polls"), this)),
@@ -131,9 +158,12 @@ ProviderPanel::ProviderPanel(std::string admin_token)
 	  revoke_button_(new QPushButton(localized("Panel.RevokeToken"), this)),
 	  connect_button_(new QPushButton(localized("OAuth.Connect"), this)),
 	  disconnect_button_(new QPushButton(localized("OAuth.Disconnect"), this)),
+	  debug_enabled_(new QCheckBox(localized("Debug.Enable"), this)),
+	  debug_output_(new QPlainTextEdit(this)),
 	  callback_timer_(new QTimer(this)),
 	  donations_timer_(new QTimer(this))
 {
+	add_plugin_qt_library_path();
 	setMinimumWidth(360);
 	setWindowTitle(localized("Panel.Title"));
 	auto *layout = new QVBoxLayout(this);
@@ -164,12 +194,18 @@ ProviderPanel::ProviderPanel(std::string admin_token)
 
 	auto *form = new QFormLayout;
 	name_->setMaxLength(80);
-	lifetime_->setRange(1, 1440);
-	lifetime_->setValue(60);
-	lifetime_->setSuffix(localized("Panel.Minutes"));
+	expiration_date_->setCalendarPopup(true);
+	expiration_date_->setMinimumDate(QDate::currentDate());
+	expiration_date_->setMaximumDate(QDate(9999, 12, 30));
+	expiration_date_->setDate(QDate::currentDate().addYears(1));
+	expiration_date_->setDisplayFormat(QLocale().dateFormat(QLocale::ShortFormat));
 	form->addRow(localized("Panel.TokenName"), name_);
-	form->addRow(localized("Panel.TokenLifetime"), lifetime_);
+	no_expiration_->setChecked(true);
+	form->addRow(no_expiration_);
+	form->addRow(localized("Panel.TokenLifetime"), expiration_date_);
 	layout->addLayout(form);
+	expiration_date_->setEnabled(false);
+	connect(no_expiration_, &QCheckBox::toggled, expiration_date_, &QWidget::setDisabled);
 
 	donation_scope_->setChecked(true);
 	goal_scope_->setEnabled(false);
@@ -186,9 +222,25 @@ ProviderPanel::ProviderPanel(std::string admin_token)
 	layout->addWidget(tokens_, 1);
 	layout->addWidget(revoke_button_);
 	status_->setWordWrap(true);
+	status_->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
 	layout->addWidget(status_);
+	layout->addWidget(copy_status_button_);
+	debug_enabled_->setToolTip(localized("Debug.Warning"));
+	layout->addWidget(debug_enabled_);
+	debug_output_->setReadOnly(true);
+	debug_output_->setMaximumBlockCount(300);
+	debug_output_->setMaximumHeight(220);
+	debug_output_->setPlaceholderText(localized("Debug.Empty"));
+	debug_output_->hide();
+	layout->addWidget(debug_output_);
 
 	revoke_button_->setEnabled(false);
+	connect(copy_status_button_, &QPushButton::clicked, this, [this] {
+		QApplication::clipboard()->setText(status_->text());
+	});
+	connect(debug_enabled_, &QCheckBox::toggled, this, [this](bool enabled) {
+		debug_output_->setVisible(enabled);
+	});
 	connect(issue_button_, &QPushButton::clicked, this, [this] { issue_token(); });
 	connect(refresh_button_, &QPushButton::clicked, this, [this] { refresh_tokens(); });
 	connect(revoke_button_, &QPushButton::clicked, this, [this] { revoke_selected_token(); });
@@ -196,11 +248,17 @@ ProviderPanel::ProviderPanel(std::string admin_token)
 	connect(disconnect_button_, &QPushButton::clicked, this, [this] {
 		callback_timer_->stop();
 		donations_timer_->stop();
+		if (donation_stream_)
+			donation_stream_->stop();
 		access_token_.clear();
 		refresh_token_.clear();
 		access_token_expires_at_ = 0;
+		oauth_flow_active_ = false;
+		publish_proxy_access_token(QString{});
 		QFile::remove(credential_path());
+		update_oauth_buttons();
 		status_->setText(localized("OAuth.Disconnected"));
+		publish_realtime_status(false, localized("OAuth.Disconnected"));
 		publish_profile(QJsonObject{}, false);
 		publish_donations(QJsonArray{});
 	});
@@ -210,18 +268,17 @@ ProviderPanel::ProviderPanel(std::string admin_token)
 	connect(callback_timer_, &QTimer::timeout, this, [this] { poll_oauth_callback(); });
 	connect(donations_timer_, &QTimer::timeout, this, [this] { poll_donations(); });
 
+	donation_stream_ = std::make_unique<DonationStream>();
 	load_credentials();
+	update_oauth_buttons();
 	refresh_tokens();
-	if (!refresh_token_.isEmpty()) {
-		const qint64 now = QDateTime::currentSecsSinceEpoch();
-		if (access_token_.isEmpty() || access_token_expires_at_ <= now + 60)
-			refresh_access_token();
-		else {
-			donations_timer_->start(5000);
-			fetch_profile();
-			poll_donations();
-		}
-	}
+	QTimer::singleShot(0, this, [this] { restore_saved_connection(); });
+}
+
+ProviderPanel::~ProviderPanel()
+{
+	if (donation_stream_)
+		donation_stream_->stop();
 }
 
 void ProviderPanel::set_busy(bool busy)
@@ -229,6 +286,13 @@ void ProviderPanel::set_busy(bool busy)
 	issue_button_->setEnabled(!busy);
 	refresh_button_->setEnabled(!busy);
 	revoke_button_->setEnabled(!busy && tokens_->currentItem() != nullptr);
+}
+
+void ProviderPanel::update_oauth_buttons()
+{
+	const bool has_credentials = !access_token_.isEmpty() || !refresh_token_.isEmpty();
+	connect_button_->setEnabled(!has_credentials && !oauth_flow_active_);
+	disconnect_button_->setEnabled(has_credentials && !oauth_flow_active_);
 }
 
 void ProviderPanel::connect_donationalerts()
@@ -245,6 +309,11 @@ void ProviderPanel::connect_donationalerts()
 		}
 	}
 
+	if (!save_credentials())
+		return;
+
+	oauth_flow_active_ = true;
+	update_oauth_buttons();
 	callback_timer_->stop();
 	oauth_state_.clear();
 	for (int index = 0; index < 4; ++index)
@@ -261,6 +330,8 @@ void ProviderPanel::connect_donationalerts()
 	query.addQueryItem(QStringLiteral("state"), oauth_state_);
 	authorization.setQuery(query);
 	if (!QDesktopServices::openUrl(authorization)) {
+		oauth_flow_active_ = false;
+		update_oauth_buttons();
 		status_->setText(localized("OAuth.OpenBrowserFailed"));
 		return;
 	}
@@ -288,6 +359,8 @@ void ProviderPanel::poll_oauth_callback()
 		const QString code = callback.value(QStringLiteral("code")).toString();
 		if (!error.isEmpty()) {
 			callback_timer_->stop();
+			oauth_flow_active_ = false;
+			update_oauth_buttons();
 			status_->setText(localized("OAuth.AuthorizationFailed").arg(error));
 			return;
 		}
@@ -295,6 +368,8 @@ void ProviderPanel::poll_oauth_callback()
 			return;
 		callback_timer_->stop();
 		if (callback.value(QStringLiteral("state")).toString() != oauth_state_) {
+			oauth_flow_active_ = false;
+			update_oauth_buttons();
 			status_->setText(localized("OAuth.StateMismatch"));
 			return;
 		}
@@ -321,6 +396,8 @@ void ProviderPanel::exchange_oauth_code(const QString &code)
 		const QString error_text = reply->errorString();
 		reply->deleteLater();
 		if (network_error != QNetworkReply::NoError) {
+			oauth_flow_active_ = false;
+			update_oauth_buttons();
 			status_->setText(response_error(body, localized("OAuth.ExchangeFailed").arg(error_text)));
 			return;
 		}
@@ -330,6 +407,8 @@ void ProviderPanel::exchange_oauth_code(const QString &code)
 		const auto object = document.object();
 		const QString access_token = object.value(QStringLiteral("access_token")).toString();
 		if (parse_error.error != QJsonParseError::NoError || access_token.isEmpty()) {
+			oauth_flow_active_ = false;
+			update_oauth_buttons();
 			status_->setText(response_error(body, localized("OAuth.InvalidTokenResponse")));
 			return;
 		}
@@ -337,7 +416,10 @@ void ProviderPanel::exchange_oauth_code(const QString &code)
 		refresh_token_ = object.value(QStringLiteral("refresh_token")).toString();
 		access_token_expires_at_ = QDateTime::currentSecsSinceEpoch() +
 					   object.value(QStringLiteral("expires_in")).toInteger(3600);
+		oauth_flow_active_ = false;
+		update_oauth_buttons();
 		const bool saved = save_credentials();
+		publish_proxy_access_token(access_token_);
 		donations_timer_->start(5000);
 		if (saved)
 			status_->setText(localized("OAuth.Connected"));
@@ -348,8 +430,15 @@ void ProviderPanel::exchange_oauth_code(const QString &code)
 
 void ProviderPanel::refresh_access_token()
 {
-	if (token_refresh_in_flight_ || refresh_token_.isEmpty())
+	if (token_refresh_in_flight_)
 		return;
+	if (refresh_token_.isEmpty()) {
+		const QString message = localized("OAuth.NoRefreshToken");
+		status_->setText(message);
+		blog(LOG_WARNING, "[DonationAlerts Provider] Automatic connection cannot refresh the OAuth token.");
+		publish_realtime_status(false, message);
+		return;
+	}
 	token_refresh_in_flight_ = true;
 	QUrlQuery form;
 	form.addQueryItem(QStringLiteral("grant_type"), QStringLiteral("refresh_token"));
@@ -370,7 +459,11 @@ void ProviderPanel::refresh_access_token()
 		reply->deleteLater();
 		token_refresh_in_flight_ = false;
 		if (network_error != QNetworkReply::NoError) {
-			status_->setText(response_error(body, localized("OAuth.RefreshFailed").arg(error_text)));
+			const QString message = response_error(body, localized("OAuth.RefreshFailed").arg(error_text));
+			status_->setText(message);
+			blog(LOG_WARNING, "[DonationAlerts Provider] OAuth token refresh failed: %s",
+			     message.toUtf8().constData());
+			publish_realtime_status(false, message);
 			return;
 		}
 
@@ -379,7 +472,10 @@ void ProviderPanel::refresh_access_token()
 		const auto object = document.object();
 		const QString access_token = object.value(QStringLiteral("access_token")).toString();
 		if (parse_error.error != QJsonParseError::NoError || access_token.isEmpty()) {
-			status_->setText(response_error(body, localized("OAuth.InvalidTokenResponse")));
+			const QString message = response_error(body, localized("OAuth.InvalidTokenResponse"));
+			status_->setText(message);
+			blog(LOG_WARNING, "[DonationAlerts Provider] OAuth token refresh returned an invalid response.");
+			publish_realtime_status(false, message);
 			return;
 		}
 		access_token_ = access_token;
@@ -389,13 +485,49 @@ void ProviderPanel::refresh_access_token()
 		access_token_expires_at_ = QDateTime::currentSecsSinceEpoch() +
 					   object.value(QStringLiteral("expires_in")).toInteger(3600);
 		const bool saved = save_credentials();
+		publish_proxy_access_token(access_token_);
 		if (!donations_timer_->isActive())
 			donations_timer_->start(5000);
 		fetch_profile();
 		poll_donations();
 		if (saved)
 			status_->setText(localized("OAuth.Connected"));
+		blog(LOG_INFO, "[DonationAlerts Provider] Saved OAuth credentials restored; account token refreshed.");
 	});
+}
+
+void ProviderPanel::restore_saved_connection()
+{
+	if (access_token_.isEmpty() && refresh_token_.isEmpty()) {
+		const QString message = localized("OAuth.NotConfigured");
+		status_->setText(message);
+		blog(LOG_INFO, "[DonationAlerts Provider] %s", message.toUtf8().constData());
+		publish_realtime_status(false, message);
+		return;
+	}
+
+	const qint64 now = QDateTime::currentSecsSinceEpoch();
+	if (!access_token_.isEmpty() && access_token_expires_at_ > now + 60) {
+		blog(LOG_INFO, "[DonationAlerts Provider] Restoring the saved DonationAlerts connection.");
+		status_->setText(localized("OAuth.Restoring"));
+		publish_proxy_access_token(access_token_);
+		donations_timer_->start(5000);
+		fetch_profile();
+		poll_donations();
+		return;
+	}
+
+	if (!refresh_token_.isEmpty()) {
+		blog(LOG_INFO, "[DonationAlerts Provider] Refreshing the saved OAuth token at OBS startup.");
+		status_->setText(localized("OAuth.Restoring"));
+		refresh_access_token();
+		return;
+	}
+
+	const QString message = localized("OAuth.NoRefreshToken");
+	status_->setText(message);
+	blog(LOG_WARNING, "[DonationAlerts Provider] Saved access token is expired and no refresh token is available.");
+	publish_realtime_status(false, message);
 }
 
 void ProviderPanel::fetch_profile()
@@ -410,6 +542,8 @@ void ProviderPanel::fetch_profile()
 		const auto network_error = reply->error();
 		const QString error_text = reply->errorString();
 		reply->deleteLater();
+		if (access_token_.isEmpty())
+			return;
 		if (network_error != QNetworkReply::NoError) {
 			status_->setText(response_error(body, localized("OAuth.ProfileFailed").arg(error_text)));
 			return;
@@ -420,7 +554,15 @@ void ProviderPanel::fetch_profile()
 			status_->setText(localized("OAuth.InvalidProfile"));
 			return;
 		}
-		const auto data = document.object().value(QStringLiteral("data")).toObject();
+		const auto response = document.object();
+		const auto data = response.value(QStringLiteral("data")).toObject();
+		add_debug_message(QStringLiteral("GET /api/v1/user/oauth — HTTP %1; fields: %2; user id: %3; Centrifugo token: %4")
+					  .arg(reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt())
+					  .arg(QStringList(data.keys()).join(QStringLiteral(", ")))
+					  .arg(data.value(QStringLiteral("id")).toVariant().toString())
+					  .arg(data.value(QStringLiteral("socket_connection_token")).toString().isEmpty()
+						       ? QStringLiteral("missing")
+						       : QStringLiteral("present (value hidden)")));
 		QJsonObject public_profile;
 		for (const auto &key : {QStringLiteral("id"), QStringLiteral("code"), QStringLiteral("name"),
 					QStringLiteral("avatar")}) {
@@ -428,6 +570,65 @@ void ProviderPanel::fetch_profile()
 				public_profile.insert(key, data.value(key));
 		}
 		publish_profile(public_profile);
+		QString socket_token = data.value(QStringLiteral("socket_connection_token")).toString();
+		if (socket_token.isEmpty())
+			socket_token = response.value(QStringLiteral("socket_connection_token")).toString();
+		const QString user_id = data.value(QStringLiteral("id")).toVariant().toString();
+		if (socket_token.isEmpty() || user_id.isEmpty()) {
+			donation_stream_->stop();
+			status_->setText(localized("OAuth.RealtimeUnavailable"));
+			publish_realtime_status(false, localized("OAuth.RealtimeUnavailable"));
+			return;
+		}
+
+		QPointer<ProviderPanel> panel(this);
+		donation_stream_->start(
+			socket_token, access_token_, user_id,
+			[panel](QJsonObject event) {
+				if (!panel)
+					return;
+				QMetaObject::invokeMethod(
+					panel,
+					[panel, event = std::move(event)] {
+						if (panel)
+							panel->publish_donation_event(event);
+					},
+					Qt::QueuedConnection);
+			},
+			[panel](QString message) {
+				if (!panel)
+					return;
+				QMetaObject::invokeMethod(
+					panel,
+					[panel, message = std::move(message)] {
+						if (!panel)
+							return;
+						const bool connected =
+							message.startsWith(QStringLiteral("DonationAlerts real-time socket connected"));
+						QString translated;
+						if (message.startsWith(QStringLiteral("Connecting to DonationAlerts")))
+							translated = localized("OAuth.RealtimeConnecting");
+						else if (connected)
+							translated = localized("OAuth.RealtimeConnected");
+						else
+							translated = localized("OAuth.RealtimeError").arg(message);
+						panel->status_->setText(translated);
+						panel->add_debug_message(message);
+						panel->publish_realtime_status(connected, translated);
+					},
+					Qt::QueuedConnection);
+			},
+			[panel](QString message) {
+				if (!panel)
+					return;
+				QMetaObject::invokeMethod(
+					panel,
+					[panel, message = std::move(message)] {
+						if (panel)
+							panel->add_debug_message(message);
+					},
+					Qt::QueuedConnection);
+			});
 	});
 }
 
@@ -446,9 +647,13 @@ void ProviderPanel::poll_donations()
 	connect(reply, &QNetworkReply::finished, this, [this, reply] {
 		const QByteArray body = reply->readAll();
 		const auto network_error = reply->error();
+		const int status_code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
 		const QString error_text = reply->errorString();
 		reply->deleteLater();
 		donation_poll_in_flight_ = false;
+		add_debug_message(QStringLiteral("REST GET /api/v1/alerts/donations — HTTP %1\n%2")
+					  .arg(status_code)
+					  .arg(QString::fromUtf8(body)));
 		if (network_error != QNetworkReply::NoError) {
 			status_->setText(response_error(body, localized("OAuth.DonationsFailed").arg(error_text)));
 			return;
@@ -461,6 +666,8 @@ void ProviderPanel::poll_donations()
 			return;
 		}
 		publish_donations(document.object().value(QStringLiteral("data")).toArray());
+		add_debug_message(QStringLiteral("REST: received %1 donation record(s).")
+					  .arg(document.object().value(QStringLiteral("data")).toArray().size()));
 		status_->setText(localized("OAuth.DataUpdated"));
 	});
 }
@@ -488,6 +695,75 @@ void ProviderPanel::publish_donations(const QJsonArray &donations)
 			status_->setText(localized("OAuth.PublishFailed").arg(reply->errorString()));
 		reply->deleteLater();
 	});
+}
+
+void ProviderPanel::publish_donation_event(const QJsonObject &event)
+{
+	QNetworkRequest request = admin_request(QStringLiteral("/api/provider/donation-event"), admin_token_);
+	request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+	auto *reply = network_->post(request, QJsonDocument(event).toJson(QJsonDocument::Compact));
+	connect(reply, &QNetworkReply::finished, this, [this, reply] {
+		const QByteArray body = reply->readAll();
+		const auto network_error = reply->error();
+		const int status_code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+		const QString error_text = reply->errorString();
+		reply->deleteLater();
+		const bool failed = network_error != QNetworkReply::NoError || status_code < 200 || status_code >= 300;
+		add_debug_message(QStringLiteral("POST /api/provider/donation-event — HTTP %1%2")
+					  .arg(status_code)
+					  .arg(!failed
+						       ? QString{}
+						       : QStringLiteral("; %1").arg(error_text)));
+		if (failed)
+			status_->setText(response_error(body, localized("OAuth.PublishFailed").arg(error_text)));
+	});
+}
+
+void ProviderPanel::publish_realtime_status(bool connected, const QString &message)
+{
+	QNetworkRequest request = admin_request(QStringLiteral("/api/provider/realtime-status"), admin_token_);
+	request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+	const QJsonObject status{{QStringLiteral("type"), QStringLiteral("status")},
+				 {QStringLiteral("connected"), connected},
+				 {QStringLiteral("message"), message}};
+	auto *reply = network_->post(request, QJsonDocument(status).toJson(QJsonDocument::Compact));
+	connect(reply, &QNetworkReply::finished, this, [this, reply] {
+		const QByteArray body = reply->readAll();
+		const auto network_error = reply->error();
+		const QString error_text = reply->errorString();
+		reply->deleteLater();
+		if (network_error != QNetworkReply::NoError)
+			status_->setText(response_error(body, localized("OAuth.PublishFailed").arg(error_text)));
+	});
+}
+
+void ProviderPanel::publish_proxy_access_token(const QString &access_token)
+{
+	QUrlQuery form;
+	form.addQueryItem(QStringLiteral("access_token"), access_token);
+	QNetworkRequest request = admin_request(QStringLiteral("/api/provider/oauth-token"), admin_token_);
+	request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
+	auto *reply = network_->post(request, form.query(QUrl::FullyEncoded).toUtf8());
+	connect(reply, &QNetworkReply::finished, this, [reply] {
+		const auto network_error = reply->error();
+		const QString error_text = reply->errorString();
+		reply->deleteLater();
+		if (network_error != QNetworkReply::NoError)
+			blog(LOG_WARNING, "[DonationAlerts Provider] Could not update the in-memory API proxy credentials: %s",
+			     error_text.toUtf8().constData());
+	});
+}
+
+void ProviderPanel::add_debug_message(const QString &message)
+{
+	if (!debug_enabled_->isChecked())
+		return;
+	constexpr qsizetype max_message_chars = 16384;
+	QString content = message;
+	if (content.size() > max_message_chars)
+		content = content.left(max_message_chars) + QStringLiteral("\n[truncated]");
+	const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz"));
+	debug_output_->appendPlainText(QStringLiteral("[%1] %2").arg(timestamp, content));
 }
 
 bool ProviderPanel::save_credentials()
@@ -573,9 +849,15 @@ void ProviderPanel::refresh_tokens()
 		for (const auto &value : document.array()) {
 			const auto token = value.toObject();
 			const QString name = token.value(QStringLiteral("name")).toString();
-			const qint64 expires_at = static_cast<qint64>(token.value(QStringLiteral("expiresAt")).toDouble());
-			const QString expiration = QDateTime::fromMSecsSinceEpoch(expires_at).toLocalTime().toString(
-				QLocale().dateTimeFormat(QLocale::ShortFormat));
+			const QJsonValue expires_at = token.value(QStringLiteral("expiresAt"));
+			const QString expiration =
+				expires_at.isNull()
+					? localized("Panel.TokenNoExpiration")
+					: QLocale().toString(
+						  QDateTime::fromMSecsSinceEpoch(static_cast<qint64>(expires_at.toDouble()))
+							  .toLocalTime()
+							  .date(),
+						  QLocale::ShortFormat);
 			const QString scopes = [this, &token] {
 				QStringList values;
 				for (const auto &scope : token.value(QStringLiteral("scopes")).toArray()) {
@@ -589,9 +871,15 @@ void ProviderPanel::refresh_tokens()
 				}
 				return values.join(QStringLiteral(", "));
 			}();
-			auto *item = new QListWidgetItem(
-				QStringLiteral("%1\n%2\n%3").arg(name, localized("Panel.TokenExpiry").arg(expiration), scopes),
-				tokens_);
+			const bool active = token.value(QStringLiteral("active")).toBool();
+			QStringList token_details{
+				expires_at.isNull() ? expiration : localized("Panel.TokenExpiry").arg(expiration),
+				active ? localized("Panel.TokenActive") : localized("Panel.TokenInactive"),
+				scopes,
+			};
+			auto *item = new QListWidgetItem(QStringLiteral("%1\n%2")
+							 .arg(name, token_details.join(QLatin1Char('\n'))),
+						 tokens_);
 			item->setData(Qt::UserRole, token.value(QStringLiteral("id")).toString());
 		}
 		status_->setText(localized("Panel.Status.ListUpdated"));
@@ -614,7 +902,11 @@ void ProviderPanel::issue_token()
 
 	QUrlQuery form;
 	form.addQueryItem(QStringLiteral("name"), name_->text());
-	form.addQueryItem(QStringLiteral("expiresInMinutes"), QString::number(lifetime_->value()));
+	const qint64 expires_at = no_expiration_->isChecked()
+					  ? 0
+					  : QDateTime(expiration_date_->date().addDays(1), QTime(0, 0), Qt::LocalTime)
+						    .toMSecsSinceEpoch();
+	form.addQueryItem(QStringLiteral("expiresAt"), QString::number(expires_at));
 	form.addQueryItem(QStringLiteral("scopes"), scopes.join(QLatin1Char(',')));
 	QNetworkRequest request = admin_request(QStringLiteral("/api/widget-tokens"), admin_token_);
 	request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
