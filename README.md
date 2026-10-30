@@ -55,6 +55,8 @@ cmake --build .\obs-plugin\build --config Release
 ctest --test-dir .\obs-plugin\build -C Release --output-on-failure
 ```
 
+Windows CI automatically builds and runs the provider-server regression tests for pushes to `main` and pull requests. The CI job does not build the OBS plugin DLL; that still requires the OBS SDK setup above.
+
 The plugin DLL is written to:
 
 ```text

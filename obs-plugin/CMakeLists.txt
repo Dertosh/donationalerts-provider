@@ -79,18 +79,7 @@ add_custom_command(TARGET donationalerts_obs_provider POST_BUILD
 
 include(CTest)
 if(BUILD_TESTING)
-  add_executable(provider-server-tests
-    src/provider_server.cpp
-    tests/provider_server_tests.cpp
-  )
-  target_compile_features(provider-server-tests PRIVATE cxx_std_20)
-  target_compile_definitions(provider-server-tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  if(MSVC)
-    target_compile_options(provider-server-tests PRIVATE /utf-8)
-  endif()
-  target_include_directories(provider-server-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-  target_link_libraries(provider-server-tests PRIVATE bcrypt crypt32 winhttp ws2_32)
-  add_test(NAME provider-server COMMAND provider-server-tests)
+  add_subdirectory(tests)
 endif()
 
 include(GNUInstallDirs)

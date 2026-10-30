@@ -55,6 +55,8 @@ cmake --build .\obs-plugin\build --config Release
 ctest --test-dir .\obs-plugin\build -C Release --output-on-failure
 ```
 
+Windows CI автоматически собирает и запускает регрессионные тесты provider-сервера при push в `main` и для Pull Request. CI пока не собирает DLL плагина OBS: для этого по-прежнему требуется подготовить OBS SDK, как описано выше.
+
 Готовый файл появится здесь:
 
 ```text

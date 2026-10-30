@@ -31,12 +31,15 @@ By submitting a contribution, you agree that your contribution is made available
 
 ## Local validation
 
-From the repository root in PowerShell:
+From the repository root in PowerShell, you can run the provider-server regression tests without building the OBS SDK:
 
 ```powershell
-cmake --build .\obs-plugin\build --config Release
-ctest --test-dir .\obs-plugin\build -C Release --output-on-failure
+cmake -S .\obs-plugin\tests -B .\build\provider-server-tests -G "Visual Studio 17 2022" -A x64
+cmake --build .\build\provider-server-tests --config Release
+ctest --test-dir .\build\provider-server-tests -C Release --output-on-failure
 git diff --check
 ```
+
+The same Windows x64 regression tests run automatically for pushes to `main` and pull requests. The full OBS plugin build still requires the OBS SDK setup described in the README.
 
 If you change a widget, also test it in an OBS Browser Source and confirm that test controls remain hidden in stream/overlay mode.

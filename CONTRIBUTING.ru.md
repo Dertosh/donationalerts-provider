@@ -31,12 +31,15 @@ git commit -s
 
 ## Локальная проверка
 
-Выполните из корня репозитория в PowerShell:
+Регрессионные тесты provider-сервера можно запустить без сборки OBS SDK. Выполните из корня репозитория в PowerShell:
 
 ```powershell
-cmake --build .\obs-plugin\build --config Release
-ctest --test-dir .\obs-plugin\build -C Release --output-on-failure
+cmake -S .\obs-plugin\tests -B .\build\provider-server-tests -G "Visual Studio 17 2022" -A x64
+cmake --build .\build\provider-server-tests --config Release
+ctest --test-dir .\build\provider-server-tests -C Release --output-on-failure
 git diff --check
 ```
+
+Эти же регрессионные тесты Windows x64 автоматически запускаются для push в `main` и Pull Request. Полная сборка OBS-плагина по-прежнему требует подготовки OBS SDK, описанной в README.
 
 Если меняли виджет, дополнительно проверьте его в Browser Source OBS и убедитесь, что тестовые элементы скрыты в режиме трансляции/оверлея.
