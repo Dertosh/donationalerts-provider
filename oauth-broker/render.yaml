@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: da-provider-oauth
+    runtime: go
+    plan: starter
+    rootDir: oauth-broker
+    buildCommand: mkdir -p bin && go build -trimpath -ldflags="-s -w" -o bin/oauth-broker ./cmd/oauth-broker
+    startCommand: ./bin/oauth-broker
+    healthCheckPath: /healthz
+    envVars:
+      - key: DONATIONALERTS_CLIENT_ID
+        sync: false
+      - key: DONATIONALERTS_CLIENT_SECRET
+        sync: false

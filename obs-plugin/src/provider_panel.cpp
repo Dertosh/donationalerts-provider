@@ -43,6 +43,7 @@
 #include <QUrlQuery>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <cstdint>
 #include <iterator>
 #include <utility>
@@ -118,6 +119,11 @@ QString api_url(const QString &path)
 	return QStringLiteral("https://www.donationalerts.com") + path;
 }
 
+QUrl oauth_broker_url(const QString &path)
+{
+	return QUrl(QStringLiteral("https://api.da-provider.dertosh.com") + path);
+}
+
 void add_plugin_qt_library_path()
 {
 	HMODULE module = nullptr;
@@ -151,8 +157,6 @@ ProviderPanel::ProviderPanel(std::string admin_token)
 	  goal_scope_(new QCheckBox(localized("Panel.Scope.Goals"), this)),
 	  poll_scope_(new QCheckBox(localized("Panel.Scope.Polls"), this)),
 	  tokens_(new QListWidget(this)),
-	  client_id_(new QLineEdit(this)),
-	  client_secret_(new QLineEdit(this)),
 	  issue_button_(new QPushButton(localized("Panel.IssueToken"), this)),
 	  refresh_button_(new QPushButton(localized("Panel.RefreshTokens"), this)),
 	  revoke_button_(new QPushButton(localized("Panel.RevokeToken"), this)),
@@ -175,13 +179,9 @@ ProviderPanel::ProviderPanel(std::string admin_token)
 
 	auto *oauth_group = new QGroupBox(localized("OAuth.Title"), this);
 	auto *oauth_layout = new QVBoxLayout(oauth_group);
-	auto *oauth_form = new QFormLayout;
-	client_id_->setPlaceholderText(localized("OAuth.ClientId"));
-	client_secret_->setPlaceholderText(localized("OAuth.ClientSecret"));
-	client_secret_->setEchoMode(QLineEdit::Password);
-	oauth_form->addRow(localized("OAuth.ClientId"), client_id_);
-	oauth_form->addRow(localized("OAuth.ClientSecret"), client_secret_);
-	oauth_layout->addLayout(oauth_form);
+	auto *oauth_hint = new QLabel(localized("OAuth.ConfiguredByService"), oauth_group);
+	oauth_hint->setWordWrap(true);
+	oauth_layout->addWidget(oauth_hint);
 	auto *callback_hint = new QLabel(
 		localized("OAuth.Callback").arg(QStringLiteral("http://127.0.0.1:4041/oauth/callback")), oauth_group);
 	callback_hint->setWordWrap(true);
@@ -253,6 +253,7 @@ ProviderPanel::ProviderPanel(std::string admin_token)
 		access_token_.clear();
 		refresh_token_.clear();
 		access_token_expires_at_ = 0;
+		credentials_migrated_ = false;
 		oauth_flow_active_ = false;
 		publish_proxy_access_token(QString{});
 		QFile::remove(credential_path());
@@ -271,6 +272,7 @@ ProviderPanel::ProviderPanel(std::string admin_token)
 	donation_stream_ = std::make_unique<DonationStream>();
 	load_credentials();
 	update_oauth_buttons();
+	load_oauth_config();
 	refresh_tokens();
 	QTimer::singleShot(0, this, [this] { restore_saved_connection(); });
 }
@@ -291,26 +293,58 @@ void ProviderPanel::set_busy(bool busy)
 void ProviderPanel::update_oauth_buttons()
 {
 	const bool has_credentials = !access_token_.isEmpty() || !refresh_token_.isEmpty();
-	connect_button_->setEnabled(!has_credentials && !oauth_flow_active_);
-	disconnect_button_->setEnabled(has_credentials && !oauth_flow_active_);
+	connect_button_->setEnabled((!has_credentials || credentials_migrated_) && !oauth_flow_active_ &&
+				    !oauth_client_id_.isEmpty());
+	disconnect_button_->setEnabled((has_credentials || credentials_migrated_) && !oauth_flow_active_);
+}
+
+void ProviderPanel::load_oauth_config()
+{
+	if (oauth_config_in_flight_ || !oauth_client_id_.isEmpty())
+		return;
+	oauth_config_in_flight_ = true;
+	QNetworkRequest request(oauth_broker_url(QStringLiteral("/v1/oauth/config")));
+	request.setTransferTimeout(10000);
+	auto *reply = network_->get(request);
+	connect(reply, &QNetworkReply::finished, this, [this, reply] {
+		const QByteArray body = reply->readAll();
+		const auto network_error = reply->error();
+		const QString error_text = reply->errorString();
+		reply->deleteLater();
+		oauth_config_in_flight_ = false;
+		if (network_error != QNetworkReply::NoError) {
+			if (access_token_.isEmpty() && refresh_token_.isEmpty())
+				status_->setText(localized("OAuth.ServiceUnavailable").arg(error_text));
+			QTimer::singleShot(15000, this, [this] { load_oauth_config(); });
+			return;
+		}
+
+		QJsonParseError parse_error{};
+		const auto document = QJsonDocument::fromJson(body, &parse_error);
+		const QString client_id = document.object().value(QStringLiteral("clientId")).toString();
+		const bool valid_client_id = !client_id.isEmpty() && client_id.size() <= 64 &&
+			std::all_of(client_id.cbegin(), client_id.cend(), [](QChar ch) { return ch.isDigit(); });
+		if (parse_error.error != QJsonParseError::NoError || !document.isObject() || !valid_client_id) {
+			if (access_token_.isEmpty() && refresh_token_.isEmpty())
+				status_->setText(localized("OAuth.ServiceUnavailable").arg(localized("OAuth.InvalidConfig")));
+			QTimer::singleShot(15000, this, [this] { load_oauth_config(); });
+			return;
+		}
+
+		oauth_client_id_ = client_id;
+		update_oauth_buttons();
+		if (credentials_migrated_)
+			status_->setText(localized("OAuth.ReconnectRequired"));
+	});
 }
 
 void ProviderPanel::connect_donationalerts()
 {
-	const QString client_id = client_id_->text().trimmed();
-	if (client_id.isEmpty() || client_secret_->text().isEmpty()) {
-		status_->setText(localized("OAuth.MissingCredentials"));
+	if (oauth_client_id_.isEmpty()) {
+		status_->setText(localized("OAuth.ServiceUnavailable").arg(localized("OAuth.InvalidConfig")));
+		load_oauth_config();
 		return;
 	}
-	for (const QChar character : client_id) {
-		if (!character.isDigit()) {
-			status_->setText(localized("OAuth.InvalidClientId"));
-			return;
-		}
-	}
-
-	if (!save_credentials())
-		return;
 
 	oauth_flow_active_ = true;
 	update_oauth_buttons();
@@ -321,7 +355,7 @@ void ProviderPanel::connect_donationalerts()
 
 	QUrl authorization(api_url(QStringLiteral("/oauth/authorize")));
 	QUrlQuery query;
-	query.addQueryItem(QStringLiteral("client_id"), client_id);
+	query.addQueryItem(QStringLiteral("client_id"), oauth_client_id_);
 	query.addQueryItem(QStringLiteral("redirect_uri"), QStringLiteral("http://127.0.0.1:4041/oauth/callback"));
 	query.addQueryItem(QStringLiteral("response_type"), QStringLiteral("code"));
 	query.addQueryItem(QStringLiteral("scope"),
@@ -381,13 +415,12 @@ void ProviderPanel::exchange_oauth_code(const QString &code)
 {
 	QUrlQuery form;
 	form.addQueryItem(QStringLiteral("grant_type"), QStringLiteral("authorization_code"));
-	form.addQueryItem(QStringLiteral("client_id"), client_id_->text().trimmed());
-	form.addQueryItem(QStringLiteral("client_secret"), client_secret_->text());
 	form.addQueryItem(QStringLiteral("redirect_uri"), QStringLiteral("http://127.0.0.1:4041/oauth/callback"));
 	form.addQueryItem(QStringLiteral("code"), code);
 
-	QNetworkRequest request(QUrl(api_url(QStringLiteral("/oauth/token"))));
+	QNetworkRequest request(oauth_broker_url(QStringLiteral("/v1/oauth/token")));
 	request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
+	request.setTransferTimeout(15000);
 	status_->setText(localized("OAuth.ExchangingCode"));
 	auto *reply = network_->post(request, form.query(QUrl::FullyEncoded).toUtf8());
 	connect(reply, &QNetworkReply::finished, this, [this, reply] {
@@ -417,8 +450,10 @@ void ProviderPanel::exchange_oauth_code(const QString &code)
 		access_token_expires_at_ = QDateTime::currentSecsSinceEpoch() +
 					   object.value(QStringLiteral("expires_in")).toInteger(3600);
 		oauth_flow_active_ = false;
-		update_oauth_buttons();
 		const bool saved = save_credentials();
+		if (saved)
+			credentials_migrated_ = false;
+		update_oauth_buttons();
 		publish_proxy_access_token(access_token_);
 		donations_timer_->start(5000);
 		if (saved)
@@ -443,14 +478,13 @@ void ProviderPanel::refresh_access_token()
 	QUrlQuery form;
 	form.addQueryItem(QStringLiteral("grant_type"), QStringLiteral("refresh_token"));
 	form.addQueryItem(QStringLiteral("refresh_token"), refresh_token_);
-	form.addQueryItem(QStringLiteral("client_id"), client_id_->text().trimmed());
-	form.addQueryItem(QStringLiteral("client_secret"), client_secret_->text());
 	form.addQueryItem(QStringLiteral("scope"),
 			  QStringLiteral("oauth-user-show oauth-donation-index oauth-donation-subscribe "
 					 "oauth-goal-subscribe oauth-poll-subscribe"));
 
-	QNetworkRequest request(QUrl(api_url(QStringLiteral("/oauth/token"))));
+	QNetworkRequest request(oauth_broker_url(QStringLiteral("/v1/oauth/token")));
 	request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/x-www-form-urlencoded"));
+	request.setTransferTimeout(15000);
 	auto *reply = network_->post(request, form.query(QUrl::FullyEncoded).toUtf8());
 	connect(reply, &QNetworkReply::finished, this, [this, reply] {
 		const QByteArray body = reply->readAll();
@@ -485,6 +519,9 @@ void ProviderPanel::refresh_access_token()
 		access_token_expires_at_ = QDateTime::currentSecsSinceEpoch() +
 					   object.value(QStringLiteral("expires_in")).toInteger(3600);
 		const bool saved = save_credentials();
+		if (saved)
+			credentials_migrated_ = false;
+		update_oauth_buttons();
 		publish_proxy_access_token(access_token_);
 		if (!donations_timer_->isActive())
 			donations_timer_->start(5000);
@@ -498,6 +535,12 @@ void ProviderPanel::refresh_access_token()
 
 void ProviderPanel::restore_saved_connection()
 {
+	if (credentials_migrated_) {
+		const QString message = localized("OAuth.ReconnectRequired");
+		status_->setText(message);
+		publish_realtime_status(false, message);
+		return;
+	}
 	if (access_token_.isEmpty() && refresh_token_.isEmpty()) {
 		const QString message = localized("OAuth.NotConfigured");
 		status_->setText(message);
@@ -769,8 +812,6 @@ void ProviderPanel::add_debug_message(const QString &message)
 bool ProviderPanel::save_credentials()
 {
 	QJsonObject credentials{
-		{QStringLiteral("clientId"), client_id_->text().trimmed()},
-		{QStringLiteral("clientSecret"), client_secret_->text()},
 		{QStringLiteral("accessToken"), access_token_},
 		{QStringLiteral("refreshToken"), refresh_token_},
 		{QStringLiteral("expiresAt"), access_token_expires_at_}
@@ -814,8 +855,10 @@ void ProviderPanel::load_credentials()
 		return;
 	}
 	const auto credentials = document.object();
-	client_id_->setText(credentials.value(QStringLiteral("clientId")).toString());
-	client_secret_->setText(credentials.value(QStringLiteral("clientSecret")).toString());
+	credentials_migrated_ = credentials.contains(QStringLiteral("clientId")) ||
+				credentials.contains(QStringLiteral("clientSecret"));
+	if (credentials_migrated_)
+		return;
 	access_token_ = credentials.value(QStringLiteral("accessToken")).toString();
 	refresh_token_ = credentials.value(QStringLiteral("refreshToken")).toString();
 	access_token_expires_at_ = credentials.value(QStringLiteral("expiresAt")).toInteger();

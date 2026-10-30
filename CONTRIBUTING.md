@@ -42,4 +42,13 @@ git diff --check
 
 The same Windows x64 regression tests run automatically for pushes to `main` and pull requests. The full OBS plugin build still requires the OBS SDK setup described in the README.
 
+Run the OAuth broker checks from the repository root:
+
+```powershell
+Push-Location .\oauth-broker
+go test -race -cover ./...
+go vet ./...
+Pop-Location
+```
+
 If you change a widget, also test it in an OBS Browser Source and confirm that test controls remain hidden in stream/overlay mode.

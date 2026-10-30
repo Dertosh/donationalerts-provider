@@ -24,8 +24,10 @@ The current build requires **OBS Studio 32.2.2 x64**. Other OBS versions and 32-
    The script checks the OBS version, plugin DLL, Qt Schannel TLS backend, and locale files, then installs them under `%ProgramData%\obs-studio\plugins`. For a DLL in a different location, pass `-DllPath "D:\Downloads\donationalerts-obs-provider.dll"`. For a non-standard OBS directory, pass `-ObsInstallRoot "D:\Apps\obs-studio"`. To install a Debug build, use `-Configuration Debug`.
 5. Start OBS. If the plugin loaded, **DonationAlerts Provider** appears in the **Tools** menu. The panel follows the OBS language and supports English and Russian.
 6. Open **Tools → DonationAlerts Provider**. This is a separate window, not an OBS dock.
-7. Enter your DonationAlerts application ID and secret. Register the exact redirect URI shown in the panel in your application settings, then click **Connect account**. Approve access in the browser. OAuth credentials are encrypted with Windows DPAPI for the current Windows user.
+7. Click **Connect account** and approve access in the DonationAlerts browser page. The shared application secret is never included in the plugin; access and refresh tokens are encrypted with Windows DPAPI for the current Windows user.
 8. Issue a widget key with donation-event access. Keys are non-expiring by default; to set an expiration, clear **Never expires** and choose a calendar date. The secret is shown only once and can be copied from the dialog. A widget key does not replace the DonationAlerts OAuth connection.
+
+When upgrading from a build that asked for your own OAuth application credentials, connect your account again once to migrate to the public application. The old credentials are removed from the local encrypted settings when the new connection is saved.
 
 To uninstall, exit OBS and remove `%ProgramData%\obs-studio\plugins\donationalerts-obs-provider`.
 
@@ -55,7 +57,7 @@ cmake --build .\obs-plugin\build --config Release
 ctest --test-dir .\obs-plugin\build -C Release --output-on-failure
 ```
 
-Windows CI automatically builds and runs the provider-server regression tests for pushes to `main` and pull requests. The CI job does not build the OBS plugin DLL; that still requires the OBS SDK setup above.
+Windows CI automatically tests the OAuth broker and builds/runs the provider-server regression tests for pushes to `main` and pull requests. The CI job does not build the OBS plugin DLL; that still requires the OBS SDK setup above.
 
 The plugin DLL is written to:
 
@@ -68,6 +70,24 @@ Alternatively, from an elevated PowerShell in the project root, install with CMa
 ```powershell
 cmake --install .\obs-plugin\build --config Release --prefix "$env:ProgramData\obs-studio"
 ```
+
+## Deploy the OAuth broker
+
+The public plugin uses a stateless OAuth broker at `https://api.da-provider.dertosh.com`. It keeps the DonationAlerts application secret on the server and forwards authorization-code and refresh-token exchanges. It has no database and does not persist OAuth tokens; tokens are stored by the plugin on the user's PC using Windows DPAPI.
+
+1. Register a DonationAlerts OAuth application for the project. Register this exact redirect URI in its settings:
+
+   ```text
+   http://127.0.0.1:4041/oauth/callback
+   ```
+
+   This is the local callback handled by the OBS plugin, not the public broker URL.
+2. In Render, create a Blueprint from `oauth-broker/render.yaml`. Set `DONATIONALERTS_CLIENT_ID` and `DONATIONALERTS_CLIENT_SECRET` as service environment variables. Enter the secret directly in Render's secret settings; never put it in Git, an issue, a commit, or this chat.
+3. Add `api.da-provider.dertosh.com` as a custom domain to the Render service. Create the DNS record using the exact CNAME target shown by Render and wait for its TLS certificate to become active. Do not guess the CNAME target.
+4. Verify `https://api.da-provider.dertosh.com/healthz` returns `{"status":"ok"}` and `/v1/oauth/config` returns the public `clientId` only.
+5. Test a new account connection and token refresh with a dedicated test DonationAlerts account before inviting users.
+
+The broker accepts only the configured OAuth grants and local redirect URI, limits request sizes and concurrent upstream calls, validates DonationAlerts token responses, and does not log request bodies. The Render service has no database. Users' tokens still pass through the broker over HTTPS during exchange and refresh, so publish a privacy policy that accurately describes this transient processing before a public release.
 
 ## Features and limitations
 

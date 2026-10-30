@@ -37,8 +37,6 @@ private:
 	QCheckBox *goal_scope_;
 	QCheckBox *poll_scope_;
 	QListWidget *tokens_;
-	QLineEdit *client_id_;
-	QLineEdit *client_secret_;
 	QPushButton *issue_button_;
 	QPushButton *refresh_button_;
 	QPushButton *revoke_button_;
@@ -51,12 +49,16 @@ private:
 	std::unique_ptr<DonationStream> donation_stream_;
 	QString access_token_;
 	QString refresh_token_;
+	QString oauth_client_id_;
 	QString oauth_state_;
 	qint64 access_token_expires_at_ = 0;
 	bool donation_poll_in_flight_ = false;
 	bool token_refresh_in_flight_ = false;
+	bool oauth_config_in_flight_ = false;
+	bool credentials_migrated_ = false;
 	bool oauth_flow_active_ = false;
 
+	void load_oauth_config();
 	void refresh_tokens();
 	void issue_token();
 	void revoke_selected_token();

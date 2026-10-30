@@ -42,4 +42,13 @@ git diff --check
 
 Эти же регрессионные тесты Windows x64 автоматически запускаются для push в `main` и Pull Request. Полная сборка OBS-плагина по-прежнему требует подготовки OBS SDK, описанной в README.
 
+Проверки OAuth-брокера запустите из корня репозитория:
+
+```powershell
+Push-Location .\oauth-broker
+go test -race -cover ./...
+go vet ./...
+Pop-Location
+```
+
 Если меняли виджет, дополнительно проверьте его в Browser Source OBS и убедитесь, что тестовые элементы скрыты в режиме трансляции/оверлея.

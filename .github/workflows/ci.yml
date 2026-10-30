@@ -14,6 +14,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  oauth-broker:
+    name: OAuth broker tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: oauth-broker/go.mod
+          cache-dependency-path: oauth-broker/go.mod
+
+      - name: Test OAuth broker
+        working-directory: oauth-broker
+        run: go test -race -cover ./...
+
+      - name: Vet OAuth broker
+        working-directory: oauth-broker
+        run: go vet ./...
+
+      - name: Build OAuth broker
+        working-directory: oauth-broker
+        run: go build -trimpath -ldflags="-s -w" ./cmd/oauth-broker
+
   provider-server-tests:
     name: Provider server tests (Windows x64)
     runs-on: windows-2022
